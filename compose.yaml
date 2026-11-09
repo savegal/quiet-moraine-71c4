@@ -1,0 +1,13 @@
+services:
+  proxima-bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_PATH: /app/data/proxima.sqlite3
+    volumes:
+      - proxima-data:/app/data
+    # One replica only. SQLite and long polling are NOT a multi-instance deployment.
+
+volumes:
+  proxima-data:

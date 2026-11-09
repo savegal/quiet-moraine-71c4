@@ -1,0 +1,4 @@
+aiohttp>=3.10,<4
+python-dotenv>=1.0,<2
+jsonschema>=4.21,<5
+tzdata>=2025.2
