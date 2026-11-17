@@ -31,13 +31,9 @@ class TelegramTransport(Telegram):
         return True
 
 
-def test_invoice_button_and_long_html_have_valid_transport_markup():
+def test_long_html_has_valid_transport_markup():
     async def run():
         tg=TelegramTransport()
-        await tg.invoice(7,'invoice',1500,2)
-        method,payload=tg.calls[-1]
-        button=payload['reply_markup']['inline_keyboard'][0][0]
-        assert method=='sendInvoice' and button=={'text':'✓ Оплатить · 1 500 Stars','pay':True,'style':'success'}
         text='<b>'+'&lt;'*1200+'</b>'
         await tg.send(7,text)
         assert tg.calls[-1][1]['text']==text
@@ -75,7 +71,7 @@ def test_order_updates_in_place_through_completion(supports_rich):
             output = body['rich_message']['html'] if supports_rich else body['text']
             assert 'На паузе' in output and '50%' in output and '14' in output
             assert ('<table bordered striped compact>' in output) == supports_rich
-        api.final['job1']['state'] = 'completed'
+        api.final['job1'].update(state='completed',finishedAt='2026-11-16T16:00:00Z')
         await worker.tick()
         await app.live_cards.tick()
         assert not app.live_cards.cards
@@ -83,6 +79,52 @@ def test_order_updates_in_place_through_completion(supports_rich):
         await app.live_cards.tick()
         assert len(app.tg.calls) == calls
         app.db.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('supports_rich',[True,False])
+def test_finished_order_keeps_updating_while_tokora_confirms_late(supports_rich,monkeypatch):
+    clock=[1_800_000_000]
+    monkeypatch.setattr('proxima_bot.db.now',lambda:clock[0])
+    monkeypatch.setattr('proxima_bot.worker.now',lambda:clock[0])
+
+    async def run():
+        app=new_app()
+        app.tg=TelegramTransport(supports_rich)
+        api=FakeTokora()
+        app.cfg=Config('fake','fake',99,dispatch_enabled=True)
+        worker=Worker(app.db,api,app.tg,app.cfg)
+        task_id=app.db.queue_task(7,'Публикация','publish',{'assets':{'accountIds':['acc7']}})
+        await worker.tick()
+        deadline=clock[0]+10
+        api.final['job1']={'id':'job1','state':'finished','published':1,'settleUntil':deadline,
+                          'finishedAt':'2026-11-16T16:00:00Z'}
+        await worker.tick()
+        await app.task(7,task_id)
+        card=app.live_cards.cards[7]
+        assert 'Поздняя проверка публикаций' in card.view[0]
+
+        clock[0]+=5
+        api.final['job1'].update(lateConfirmed=1,published=2,checkers=2,checkersTotal=3,
+                                errorCounts=[{'code':'session_expired','count':1},
+                                             {'code':'provider-internal','count':1}])
+        await worker.refresh_settlements()
+        await app.live_cards.tick()
+        assert app.live_cards.cards[7] is card
+        assert 'Поздние подтверждения' in card.view[0]
+
+        clock[0]+=5
+        api.final['job1'].update(publishedAfterFinish=2,published=3)
+        await worker.refresh_settlements()
+        await app.live_cards.tick()
+        assert 7 not in app.live_cards.cards
+        edits=[body for method,body in app.tg.calls if method=='editMessageText']
+        assert [body['message_id'] for body in edits]==[card.message_id,card.message_id]
+        output=edits[-1]['rich_message']['html'] if supports_rich else edits[-1]['text']
+        assert 'Публикации после завершения' in output and 'Поздняя проверка публикаций' not in output
+        assert 'Сессия истекла' in output and 'provider-internal' not in output
+        app.db.close()
+
     asyncio.run(run())
 
 
@@ -139,7 +181,7 @@ def test_expired_member_cannot_submit_old_source_reply_confirmation():
     asyncio.run(run())
 
 
-def test_promo_and_payment_keep_access_ledger_consistent():
+def test_manual_access_and_promo_keep_access_ledger_consistent():
     async def run():
         app = new_app()
         app.tg = TelegramTransport()
@@ -154,15 +196,10 @@ def test_promo_and_payment_keep_access_ledger_consistent():
         assert await app.command(7,'/promo '+code.lower())
         assert app.db.user(7)['expires_at'] == previous+2*86400
         assert not app.db.redeem_promo(8,code)
-        invoice = app.db.create_invoice(7,50,days=1)
-        app.db.conn.execute('UPDATE invoices SET expires_at=0 WHERE payload=?',(invoice,))
         app.db.modify_access(7,99,'block')
-        assert not app.db.invoice_valid(7,invoice,50)
-        assert app.db.paid_invoice(7,invoice,50,'charge',30) == previous+3*86400
         assert app.db.user(7)['blocked']
-        assert app.db.paid_invoice(7,invoice,50,'charge',30) is None
-        assert [(row['action'],row['days']) for row in app.db.subscriptions(7)][:3] == [
-            ('stars',1),('block',0),('promo',2)]
+        assert [(row['action'],row['days']) for row in app.db.subscriptions(7)][:2] == [
+            ('block',0),('promo',2)]
         app.db.close()
     asyncio.run(run())
 

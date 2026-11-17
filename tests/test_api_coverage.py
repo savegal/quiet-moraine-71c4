@@ -129,8 +129,8 @@ def test_every_declared_operation_has_a_verified_route(tmp_path):
                         assert json.loads(output.read_bytes()) == {}
         finally:
             await runner.cleanup()
-        assert len(ids) == 106 and len(seen) == 101
-        assert counts == {'op/cli': 77, 'cli': 24, 'managed': 4, 'cabinet': 1}
+        assert len(ids) == 109 and len(seen) == 93
+        assert counts == {'op/cli': 64, 'cli': 29, 'managed': 16}
 
     asyncio.run(run())
 
@@ -276,7 +276,7 @@ def test_oversized_stream_is_rejected_without_replaying_write(monkeypatch):
         monkeypatch.setattr('proxima_bot.api.MAX_JSON_BYTES', 32)
         api = Tokora(session, 'https://example.invalid', 'unit-test')
         with pytest.raises(ApiError) as error:
-            await api.start({'requestId': 'test'})
+            await api.start({'requestId': 'test','accountFolder':'1234abcd'})
         assert error.value.code == 'invalid_response' and session.requests == 1
 
     asyncio.run(run())

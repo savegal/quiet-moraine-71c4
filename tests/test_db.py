@@ -48,16 +48,6 @@ def test_queue_idempotent_request_id_on_restart(db):
     assert first==json.loads(db.next_eligible(99)['payload_json'])['requestId']
 
 
-def test_payment_receipt_cannot_double_credit(db):
-    invoice=db.create_invoice(1,120)
-    assert db.invoice_valid(1,invoice,120)
-    assert not db.invoice_valid(2,invoice,120)
-    assert not db.invoice_valid(1,invoice,119)
-    first=db.paid_invoice(1,invoice,120,'tgcharge123',30)
-    assert first is not None
-    assert db.paid_invoice(1,invoice,120,'tgcharge123',30) is None
-    assert db.paid_invoice(1,invoice,120,'tgcharge999',30) is None
-    assert db.user(1)['expires_at']==first
 
 
 def test_expired_users_do_not_block_active_user_queue(db):

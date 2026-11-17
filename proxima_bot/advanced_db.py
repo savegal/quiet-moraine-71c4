@@ -9,11 +9,11 @@ import hashlib
 import secrets
 import sqlite3
 import time
-from .db import Store, now
+from .db import Store, UNKNOWN_TASK_POOL, WORKSPACE_ACTION, now
 
 class ExtendedStore(Store):
-    def __init__(self,location:str):
-        super().__init__(location)
+    def __init__(self,location:str,*,timezone_name:str='Europe/Moscow'):
+        super().__init__(location,timezone_name=timezone_name)
         self.conn.executescript('''
         CREATE TABLE IF NOT EXISTS user_templates (
           user_id INTEGER NOT NULL, template_id TEXT NOT NULL, name TEXT NOT NULL,
@@ -39,6 +39,17 @@ class ExtendedStore(Store):
         CREATE TABLE IF NOT EXISTS promo_codes (
           digest TEXT PRIMARY KEY, days INTEGER NOT NULL, expires_at INTEGER NOT NULL,
           issuer INTEGER NOT NULL, used_by INTEGER);
+        CREATE TABLE IF NOT EXISTS owner_callbacks (
+          owner_id INTEGER NOT NULL, route TEXT NOT NULL, callback TEXT NOT NULL,
+          PRIMARY KEY(owner_id,route));
+        CREATE TABLE IF NOT EXISTS order_mode_access (
+          mode TEXT PRIMARY KEY, restricted INTEGER NOT NULL CHECK(restricted IN (0,1)));
+        CREATE TABLE IF NOT EXISTS account_imports (
+          import_id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, target_id INTEGER NOT NULL,
+          state TEXT NOT NULL, summary_json TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS account_import_items (
+          import_id TEXT NOT NULL, account_id TEXT NOT NULL, ready INTEGER NOT NULL,
+          PRIMARY KEY(import_id,account_id));
         ''')
         columns={r[1] for r in self.conn.execute('PRAGMA table_info(users)')}
         for key,definition in {
@@ -48,8 +59,12 @@ class ExtendedStore(Store):
            'daily_limit':'INTEGER',
            'open_limit':'INTEGER',
            'search_text':"TEXT NOT NULL DEFAULT ''",
+           'can_use_photos':'INTEGER NOT NULL DEFAULT 0',
         }.items():
             if key not in columns:self.conn.execute(f'ALTER TABLE users ADD COLUMN {key} {definition}')
+        tpl_columns={r[1] for r in self.conn.execute('PRAGMA table_info(user_templates)')}
+        if 'is_shared' not in tpl_columns:
+            self.conn.execute('ALTER TABLE user_templates ADD COLUMN is_shared INTEGER NOT NULL DEFAULT 0')
         for row in self.conn.execute("SELECT user_id,username,full_name FROM users WHERE search_text='' AND (username!='' OR full_name!='')").fetchall():
             self.conn.execute('UPDATE users SET search_text=? WHERE user_id=?',
                 ((row['username']+' '+row['full_name']).casefold(),row['user_id']))
@@ -59,6 +74,60 @@ class ExtendedStore(Store):
         r=self.conn.execute('UPDATE tasks SET fire_at=? WHERE task_id=? AND user_id=? AND state=?',
                             (fire_at,task_id,uid,'queued'))
         return r.rowcount==1
+
+    def save_owner_route(self,uid:int,route:str,callback:str)->None:
+        self.conn.execute('INSERT OR IGNORE INTO owner_callbacks VALUES (?,?,?)',(uid,route,callback))
+
+    def owner_route(self,uid:int,route:str)->str:
+        row=self.conn.execute('SELECT callback FROM owner_callbacks WHERE owner_id=? AND route=?',(uid,route)).fetchone()
+        return row[0] if row else ''
+
+    def create_account_import(self,import_id:str,owner_id:int,target_id:int,summary:dict)->None:
+        self.conn.execute('INSERT INTO account_imports VALUES (?,?,?,?,?)',
+                          (import_id,owner_id,target_id,'running',json.dumps(summary,ensure_ascii=False)))
+
+    def save_account_import(self,import_id:str,state:str,summary:dict)->None:
+        self.conn.execute('UPDATE account_imports SET state=?,summary_json=? WHERE import_id=?',
+                          (state,json.dumps(summary,ensure_ascii=False),import_id))
+
+    def account_import(self,owner_id:int,*,import_id:str|None=None,target_id:int|None=None)->dict|None:
+        if import_id:
+            row=self.conn.execute('SELECT * FROM account_imports WHERE owner_id=? AND import_id=?',
+                                  (owner_id,import_id)).fetchone()
+        else:
+            row=self.conn.execute('SELECT * FROM account_imports WHERE owner_id=? AND target_id=? ORDER BY rowid DESC LIMIT 1',
+                                  (owner_id,target_id)).fetchone()
+        return {**dict(row),'summary':json.loads(row['summary_json'])} if row else None
+
+    def save_account_import_item(self,import_id:str,account_id:str,ready:bool)->None:
+        self.conn.execute('INSERT OR IGNORE INTO account_import_items VALUES (?,?,?)',
+                          (import_id,account_id,int(ready)))
+
+    def account_import_items(self,import_id:str)->list[tuple[str,bool]]:
+        return [(row[0],bool(row[1])) for row in self.conn.execute(
+            'SELECT account_id,ready FROM account_import_items WHERE import_id=? ORDER BY rowid',(import_id,))]
+
+    def assign_available_accounts(self,uid:int,candidates:list[str])->int:
+        with self._write_transaction():
+            leased = self._leased_accounts()
+            if WORKSPACE_ACTION in leased:
+                raise ValueError('Дождись завершения операции в кабинете.')
+            used, unknown_pool = self._task_accounts(include_queued=True)
+            if unknown_pool:
+                raise ValueError(UNKNOWN_TASK_POOL)
+            busy = leased | used
+            self.register(uid)
+            already_assigned = {row[0] for row in self.conn.execute('SELECT account_id FROM accounts')}
+            assignable = [account for account in dict.fromkeys(candidates)
+                          if account not in busy and account not in already_assigned]
+            if not assignable:
+                return 0
+            # Reassignment replaces any stale owner access from an earlier targeted import.
+            self.conn.executemany('DELETE FROM imported_owner_access WHERE account_id=?',
+                                  ((account,) for account in assignable))
+            result=self.conn.executemany('INSERT OR IGNORE INTO accounts(account_id,user_id) VALUES (?,?)',
+                                         ((account,uid) for account in assignable))
+            return result.rowcount
 
     def owned(self,kind:str,object_id:str,uid:int)->bool:
         row=self.conn.execute('SELECT user_id FROM external_objects WHERE kind=? AND external_id=?',
@@ -79,21 +148,49 @@ class ExtendedStore(Store):
         self.conn.execute('DELETE FROM external_objects WHERE kind=? AND external_id=? AND user_id=?',
                           (kind,object_id,uid))
 
-    def save_template(self,uid:int,name:str,mode:str,payload:dict)->str:
+    def save_template(self,uid:int,name:str,mode:str,payload:dict,*,template_id:str|None=None,draft_token:str|None=None)->str:
         import secrets
-        template_id=secrets.token_hex(4)
         if len(name)>64 or not name.strip():raise ValueError('Название шаблона должно содержать от 1 до 64 символов.')
         data=json.dumps(payload,ensure_ascii=False)
         if len(data)>512_000:raise ValueError('Шаблон слишком большой. Сократи список ссылок или текстов.')
-        count=self.conn.execute('SELECT COUNT(*) FROM user_templates WHERE user_id=?',(uid,)).fetchone()[0]
-        if count>=50:raise ValueError('Максимум 50 шаблонов')
-        self.conn.execute('INSERT INTO user_templates VALUES (?,?,?,?,?,?)',
-                          (uid,template_id,name.strip(),mode,data,now()))
+        self.conn.execute('BEGIN IMMEDIATE')
+        try:
+            if draft_token is not None:
+                draft=self.draft(uid)
+                if (not draft or draft['mode']!='local_template' or draft['step']!='review'
+                        or draft['data'].get('token')!=draft_token
+                        or draft['data'].get('template_id')!=template_id):
+                    raise ValueError('Подтверждение устарело. Открой шаблон заново.')
+            if template_id is not None:
+                changed=self.conn.execute('UPDATE user_templates SET name=?,mode=?,payload=? WHERE user_id=? AND template_id=?',
+                                          (name.strip(),mode,data,uid,template_id)).rowcount
+                if not changed:raise ValueError('Шаблон больше не существует.')
+            else:
+                count=self.conn.execute('SELECT COUNT(*) FROM user_templates WHERE user_id=?',(uid,)).fetchone()[0]
+                if count>=50:raise ValueError('Максимум 50 шаблонов')
+                template_id=secrets.token_hex(4)
+                self.conn.execute('INSERT INTO user_templates(user_id,template_id,name,mode,payload,created_at,is_shared) VALUES (?,?,?,?,?,?,0)',
+                                  (uid,template_id,name.strip(),mode,data,now()))
+            if draft_token is not None:self.clear_draft(uid)
+            self.conn.execute('COMMIT')
+        except Exception:
+            self.conn.execute('ROLLBACK')
+            raise
         return template_id
 
     def templates(self,uid:int):
-        return [dict(r) for r in self.conn.execute(
-            'SELECT template_id,name,mode FROM user_templates WHERE user_id=? ORDER BY created_at DESC,rowid DESC',(uid,))]
+        owner_id=getattr(self,'owner_id',0)
+        if owner_id and owner_id!=uid:
+            rows=self.conn.execute(
+                '''SELECT template_id,name,mode,user_id,is_shared FROM user_templates
+                   WHERE user_id=? OR (user_id=? AND is_shared=1)
+                   ORDER BY (user_id=?) DESC, created_at DESC, rowid DESC''',
+                (uid,owner_id,uid))
+        else:
+            rows=self.conn.execute(
+                'SELECT template_id,name,mode,user_id,is_shared FROM user_templates WHERE user_id=? ORDER BY created_at DESC,rowid DESC',
+                (uid,))
+        return [{**dict(r),'owned':r['user_id']==uid,'is_shared':bool(r['is_shared'])} for r in rows]
 
     def completed_collections(self,uid:int,limit:int,offset:int):
         return [dict(r) for r in self.conn.execute(
@@ -101,9 +198,21 @@ class ExtendedStore(Store):
                WHERE user_id=? AND kind='fetch' AND state='completed' AND upstream_id IS NOT NULL AND hidden=0
                ORDER BY created_at DESC,rowid DESC LIMIT ? OFFSET ?""",(uid,limit,offset))]
 
-    def template(self,uid:int,template_id:str):
-        row=self.conn.execute('SELECT * FROM user_templates WHERE user_id=? AND template_id=?',(uid,template_id)).fetchone()
-        return dict(row) if row else None
+    def template(self,uid:int,template_id:str,*,owned_only:bool=False):
+        owner_id=getattr(self,'owner_id',0)
+        if owned_only or not owner_id or owner_id==uid:
+            row=self.conn.execute('SELECT * FROM user_templates WHERE user_id=? AND template_id=?',(uid,template_id)).fetchone()
+        else:
+            row=self.conn.execute(
+                '''SELECT * FROM user_templates WHERE template_id=? AND (user_id=? OR (user_id=? AND is_shared=1))
+                   ORDER BY (user_id=?) DESC LIMIT 1''',
+                (template_id,uid,owner_id,uid)).fetchone()
+        return {**dict(row),'owned':row['user_id']==uid,'is_shared':bool(row['is_shared'])} if row else None
+
+    def set_template_shared(self,uid:int,template_id:str,shared:bool)->bool:
+        r=self.conn.execute('UPDATE user_templates SET is_shared=? WHERE user_id=? AND template_id=?',
+                            (int(bool(shared)),uid,template_id))
+        return r.rowcount>0
 
     def delete_template(self,uid:int,template_id:str)->bool:
         r=self.conn.execute('DELETE FROM user_templates WHERE user_id=? AND template_id=?',(uid,template_id))
@@ -120,6 +229,20 @@ class ExtendedStore(Store):
     def log(self,uid:int,action:str,target:str=''):
         self.conn.execute('INSERT INTO audit(user_id,action,target,at) VALUES (?,?,?,?)',
                           (uid,action[:64],target[:128],now()))
+
+    def order_mode_access(self) -> dict[str, bool]:
+        return {row['mode']: bool(row['restricted']) for row in self.conn.execute(
+            'SELECT mode,restricted FROM order_mode_access')}
+
+    def set_order_mode_access(self, actor: int, mode: str, restricted: bool) -> None:
+        with self._write_transaction():
+            result = self.conn.execute('''
+                INSERT INTO order_mode_access(mode,restricted) VALUES (?,?)
+                ON CONFLICT(mode) DO UPDATE SET restricted=excluded.restricted
+                WHERE order_mode_access.restricted!=excluded.restricted
+            ''', (mode, restricted))
+            if result.rowcount:
+                self.log(actor, 'order_mode_restrict' if restricted else 'order_mode_allow', mode)
 
     # Owner dashboard: bounded, tenant-aware queries without provider secrets.
     def touch_user(self,uid:int,first:str='',last:str='',username:str='') -> None:
@@ -152,8 +275,6 @@ class ExtendedStore(Store):
         result['task_states']={r['state']:r['n'] for r in grouped}
         result['tasks_total']=sum(r['n'] for r in grouped)
         result['accounts_total']=self.conn.execute('SELECT COUNT(*) FROM accounts WHERE user_id=?',(uid,)).fetchone()[0]
-        result['stars_paid']=self.conn.execute('''SELECT COALESCE(SUM(i.stars),0) FROM invoices i
-            JOIN charges c ON c.invoice_payload=i.payload WHERE c.user_id=? AND c.refunded_at=0''',(uid,)).fetchone()[0]
         return result
 
     def admin_tasks(self,offset:int=0,limit:int=12,uid:int|None=None,status:str='all')->tuple[list[dict],int]:
@@ -176,9 +297,6 @@ class ExtendedStore(Store):
             'failed_tasks':self.conn.execute("SELECT COUNT(*) FROM tasks WHERE state IN ('failed','unknown')").fetchone()[0],
             'tasks_total':self.conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0],
             'assigned_accounts':self.conn.execute('SELECT COUNT(*) FROM accounts').fetchone()[0],
-            'stars_paid':self.conn.execute('''SELECT COALESCE(SUM(i.stars),0) FROM invoices i
-                JOIN charges c ON c.invoice_payload=i.payload WHERE c.refunded_at=0''').fetchone()[0],
-            'payments':self.conn.execute('SELECT COUNT(*) FROM charges WHERE refunded_at=0').fetchone()[0],
         })
         return q
 
@@ -186,11 +304,6 @@ class ExtendedStore(Store):
         where='WHERE user_id=?' if uid is not None else ''
         return [dict(r) for r in self.conn.execute('SELECT * FROM subscription_events '+where+' ORDER BY event_id DESC LIMIT ?',
             (uid,min(50,limit)) if uid is not None else (min(50,limit),))]
-
-    def payments(self,limit:int=15)->list[dict]:
-        return [dict(r) for r in self.conn.execute('''SELECT i.user_id,i.stars,i.created_at,c.charge_id,c.created_at paid_at,c.refunded_at
-            FROM invoices i JOIN charges c ON c.invoice_payload=i.payload
-            ORDER BY c.created_at DESC LIMIT ?''',(min(limit,50),))]
 
     def audit_entries(self,limit:int=20)->list[dict]:
         return [dict(r) for r in self.conn.execute('SELECT * FROM audit ORDER BY row_id DESC LIMIT ?',
@@ -231,6 +344,22 @@ class ExtendedStore(Store):
         self.conn.execute('UPDATE users SET '+columns[field]+'=? WHERE user_id=?',(value,uid))
         self.log(actor,'limit_'+field,f'{uid}:{value}')
 
+    def can_use_photos(self,uid:int)->bool:
+        if uid==getattr(self,'owner_id',0):
+            return True
+        user=self.user(uid)
+        return bool(user and user.get('can_use_photos'))
+
+    def toggle_photo_access(self,uid:int,actor:int)->bool:
+        if uid<=0 or uid==getattr(self,'owner_id',0):
+            raise ValueError('Нельзя изменить доступ к фото этому пользователю.')
+        self.register(uid)
+        current=self.can_use_photos(uid)
+        new_value=not current
+        self.conn.execute('UPDATE users SET can_use_photos=? WHERE user_id=?',(int(new_value),uid))
+        self.log(actor,'photo_access_'+('on' if new_value else 'off'),str(uid))
+        return new_value
+
     def queue_task(self,uid:int,name:str,kind:str,payload:dict,**kwargs)->str:
         member=self.user(uid)
         if uid==getattr(self,'owner_id',0):
@@ -240,40 +369,6 @@ class ExtendedStore(Store):
             if member['daily_limit'] is not None:kwargs['max_daily']=int(member['daily_limit'])
             if member['open_limit'] is not None:kwargs['max_open']=int(member['open_limit'])
         return super().queue_task(uid,name,kind,payload,**kwargs)
-
-    def record_payment_access(self,uid:int,stars:int,days:int,previous:int,expiry:int)->int:
-        return self.record_subscription(uid,0,'stars',days,previous,expiry,f'{stars} XTR')
-
-    def payment_superseded(self,uid:int,paid_at:int)->bool:
-        return self.conn.execute("""SELECT 1 FROM subscription_events
-            WHERE user_id=? AND action IN ('replace','revoke') AND at>? LIMIT 1""",(uid,paid_at)).fetchone() is not None
-
-    def record_refund_access(self,uid:int,event_id:int,stars:int)->bool:
-        if event_id==-1:
-            expiry=self.user(uid)['expires_at']
-            self.record_subscription(uid,0,'refund',0,expiry,expiry,f'{stars} XTR')
-            return True
-        payment=self.conn.execute("SELECT 1 FROM subscription_events WHERE user_id=? AND event_id=? AND action='stars'",
-                                  (uid,event_id)).fetchone()
-        if not payment:return False
-        previous=self.user(uid)['expires_at']
-        reset=self.conn.execute('''SELECT event_id,new_expires FROM subscription_events
-            WHERE user_id=? AND action IN ('replace','revoke') ORDER BY event_id DESC LIMIT 1''',(uid,)).fetchone()
-        if reset and reset['event_id']>event_id:
-            # A later manual replacement starts its own access period.
-            self.record_subscription(uid,0,'refund',0,previous,previous,f'{stars} XTR')
-            return True
-        rows=self.conn.execute('''SELECT e.*,c.refunded_at,c.created_at AS paid_at FROM subscription_events e
-            LEFT JOIN charges c ON c.grant_event_id=e.event_id
-            WHERE e.user_id=? AND e.event_id>? ORDER BY e.event_id''',(uid,reset['event_id'] if reset else 0)).fetchall()
-        expiry=reset['new_expires'] if reset else rows[0]['previous_expires']
-        for row in rows:
-            if row['action'] in ('extend','promo','stars') and not row['refunded_at']:
-                expiry=max(expiry,row['paid_at'] or row['at'])+row['days']*86400
-        expiry=min(previous,expiry)
-        self.conn.execute('UPDATE users SET expires_at=? WHERE user_id=?',(expiry,uid))
-        self.record_subscription(uid,0,'refund',0,previous,expiry,f'{stars} XTR')
-        return True
 
     def issue_promo(self, actor:int, days:int) -> str:
         if not 1 <= days <= 36500:

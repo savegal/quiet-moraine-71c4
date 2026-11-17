@@ -14,7 +14,16 @@ from jsonschema import Draft202012Validator
 
 SPEC_PATH=Path(__file__).parent.parent/'docs/tokora-openapi.json'
 QUEUE_OPERATIONS={'postTasks','postSchedules','deleteTasksById'}
-LOCAL_ONLY={'postAccountsImport','postAccountsImportFile','postProxies','patchProxiesById','putAccountsByIdProxy'}
+MANAGED_ACCOUNT_PROXY_OPERATIONS = {
+    'postAccountsPurge', 'deleteAccountsById', 'postAccountsCheck', 'deleteAccountsCheck',
+    'postAccountsByIdCheck', 'postAccountsByIdProfileRefresh', 'putAccountsByIdProxy',
+    'getAccountsByIdVideosByVideoComments', 'getAccountsByIdVideosByVideoCommentsByCidReplies',
+    'putAccountsByIdVideosByVideoCommentsByCidLike', 'postProxiesCheck', 'deleteProxiesCheck', 'deleteProxies',
+}
+LOCAL_ONLY = {
+    'postAccountsImport', 'postAccountsImportFile', 'postAccountsImportCheck', 'postProxies', 'patchProxiesById',
+    'getAccounts', 'getAccountsById', 'getAccountsCheck', 'getProxies', 'getProxiesCheck',
+}
 VALID_ID=re.compile(r'^[a-zA-Z0-9_-]{1,128}$')
 
 
@@ -42,8 +51,7 @@ def binary_response(operation:dict)->bool:
 
 def operation_channel(operation:dict)->str:
     name=operation['operationId']
-    if name=='postAccountsPurge':return 'cabinet'
-    if name in QUEUE_OPERATIONS or name=='deleteAccountsById':return 'managed'
+    if name in QUEUE_OPERATIONS or name in MANAGED_ACCOUNT_PROXY_OPERATIONS:return 'managed'
     body_types=operation.get('requestBody',{}).get('content',{})
     if name in LOCAL_ONLY or binary_response(operation) or (body_types and 'application/json' not in body_types):
         return 'cli'
@@ -62,7 +70,9 @@ def operation_plan(operation_id:str,raw:dict,*,local:bool=False,upload_type:str=
     if operation_id=='deleteAccountsById':
         raise ValueError('Отвяжи аккаунт от команды и удали его из карточки владельца.')
     if operation_id=='postAccountsPurge':
-        raise ValueError('Массовая очистка выполняется в кабинете после завершения заказов.')
+        raise ValueError('Массовая очистка доступна в серверной CLI через purge-accounts.')
+    if operation_id in MANAGED_ACCOUNT_PROXY_OPERATIONS:
+        raise ValueError('Открой действие в разделе «Аккаунты» или «Прокси».')
     if operation_channel(op)=='cli' and not local:
         raise ValueError('Эта операция доступна в серверной CLI. Для медиа и результатов также есть отдельные экраны бота.')
     rp=raw.get('path',{})
@@ -78,6 +88,8 @@ def operation_plan(operation_id:str,raw:dict,*,local:bool=False,upload_type:str=
         path=path.replace('{'+param+'}',quote(value,safe=''))
     params=raw.get('query',{})
     if not isinstance(params,dict):raise ValueError('query must be object')
+    if operation_id=='getAccounts' and 'task' in params and 'folder' in params:
+        raise ValueError('Для списка аккаунтов укажи либо task, либо folder.')
     allowed={p['name']:p for p in op.get('parameters',[]) if p.get('in')=='query'}
     if set(params)-set(allowed):raise ValueError('Unknown query field')
     if any(p.get('required') and name not in params for name,p in allowed.items()):

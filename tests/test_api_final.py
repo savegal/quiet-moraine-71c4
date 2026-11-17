@@ -37,9 +37,14 @@ def test_member_results_project_only_public_fields():
                 {'text':'Третий текст','url':'https://token@tiktok.com/private'},
             ]}
 
+        async def download(path):
+            assert path == '/v1/tasks/tokora-internal-task/links'
+            raise ApiError('not_found',404)
+
         app.api.account_page=account_page
         app.api.publication=publication
         app.api.call=entries
+        app.api.download=download
         await app.accounts(7)
         await app.task(7,tid)
         await app.report(7,tid)
@@ -85,6 +90,29 @@ def test_revoked_member_cannot_verify_or_pause_and_finished_refresh_reads_snapsh
         await app.callback(7,{'data':'refresh:'+tid})
         assert json.loads(app.db.task(tid)['snapshot_json'])['published']==3
         app.db.close()
+    asyncio.run(run())
+
+
+def test_member_verification_checks_the_accounts_actually_sent_to_api():
+    async def run():
+        app=new_app()
+        app.db.assign(7,'excluded')
+        tid=app.db.queue_task(7,'Проверка','publish',{'assets':{'accountIds':['acc7','excluded']}})
+        assert app.db.claim_start(tid,'queued',99,launch_payload={'assets':{'accountIds':['acc7']}})
+        app.db.transition(tid,'completed',upstream_id='test1')
+        app.db.assign(8,'excluded')
+        calls=[]
+
+        async def verify(task_id):
+            calls.append(task_id)
+            return {'id':task_id,'state':'completed','published':4}
+
+        app.api.verify=verify
+        await app.callback(7,{'data':'verify:'+tid})
+        assert calls==['test1']
+        assert json.loads(app.db.task(tid)['snapshot_json'])['published']==4
+        app.db.close()
+
     asyncio.run(run())
 
 
@@ -155,7 +183,7 @@ def test_http_contract_rich_send_edit_and_single_start_with_retry_after():
                 await telegram.edit_rich(7,result['message_id'],rich,markup)
                 tokora=Tokora(session,url,'fake-key')
                 with pytest.raises(ApiError) as error:
-                    await tokora.start({'requestId':'test-request','kind':'fetch'})
+                    await tokora.start({'requestId':'test-request','kind':'fetch','accountFolder':'1234abcd'})
                 assert error.value.status==429 and error.value.retry_after==45
                 with pytest.raises(ApiError) as blocked:await tokora.active_tasks()
                 assert blocked.value.status==429

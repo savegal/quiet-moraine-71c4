@@ -5,6 +5,9 @@ import json
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
+from .db import PUBLICATION_TIMER_KINDS, snapshot_preparing, snapshot_publication_started, task_execution_limit_seconds
+from .api import task_finish_pending
+
 BUTTON_SYMBOLS = frozenset('▣◇◈▤▥▧⌂⌕⚙◷✓×↻＋←→↶↪↗⇩↑♡▷▶Ⅱ■✎−·○!')
 
 STATE_DISPLAY = {
@@ -33,6 +36,18 @@ MODE_SYMBOLS = {
     'import': '↑',
 }
 
+TASK_PHASES = {
+    'prepare':'Подготовка аккаунтов', 'preparing':'Подготовка аккаунтов',
+    'init':'Подготовка аккаунтов', 'warming_prepare':'Подготовка аккаунтов',
+    'publish':'Публикации начались', 'publishing':'Публикации начались',
+    'comments':'Комментарии', 'replies':'Ответы',
+    'verify':'Проверка публикаций', 'verifying':'Проверка публикаций',
+    'likes':'Лайки комментариев', 'liking':'Лайки комментариев',
+    'commentlike':'Лайки комментариев', 'like_comments':'Лайки комментариев',
+    'fetch':'Сбор комментариев', 'collecting':'Сбор результатов',
+    'settle':'Поздняя проверка публикаций', 'settling':'Поздняя проверка публикаций',
+}
+
 
 def h(value:Any) -> str:
     return escape(str(value if value is not None else ''),quote=True)
@@ -40,7 +55,7 @@ def h(value:Any) -> str:
 
 def button_text(label:str)->str:
     label=' '.join(label.split())
-    if label and label[0] in BUTTON_SYMBOLS:
+    if label and (label[0] in BUTTON_SYMBOLS or label.isdecimal()):
         return label
     return '◇ '+(label or 'Открыть')
 
@@ -88,6 +103,13 @@ def days_label(days:int)->str:
         return f'{days} дней'
     word={1:'день',2:'дня',3:'дня',4:'дня'}.get(days%10,'дней')
     return f'{days} {word}'
+
+
+def minutes_label(minutes:int)->str:
+    if 11<=minutes%100<=14:
+        return f'{minutes} минут'
+    word={1:'минута',2:'минуты',3:'минуты',4:'минуты'}.get(minutes%10,'минут')
+    return f'{minutes} {word}'
 
 
 def home(expires:int,owner:bool,counts:dict)->tuple[str,dict]:
@@ -141,11 +163,26 @@ def table_html(title:str,items:list[tuple[str,Any]],caption:str='')->tuple[str,s
 
 
 ERROR_LABELS={
+    'external_pool_unknown':'В кабинете идёт другой заказ. Сервер не показал, какие аккаунты он использует. Бот дождётся освобождения кабинета.',
+    'invalid_target':'Исполнитель отклонил цели заказа. Проверь выбранные видео или комментарии и подтверди заказ снова.',
+    'invalid_source':'Исходный сбор недоступен или ещё не завершён.',
+    'missing_source':'Для выбранных комментариев нужен исходный сбор.',
+    'empty_job':'В заказе нет комментариев для ответов.',
+    'invalid_reply_links':'Исполнитель не смог разобрать список ссылок. Проверь его и повтори заказ.',
+    'too_many_reply_links':'В одном заказе по ссылкам допускается до 300 непустых строк.',
+    'invalid_order_targets':'Не удалось проверить ссылки заказа. Укажи корректную ссылку на видео или комментарий для выбранного действия.',
+    'short_link_retry':'Короткая ссылка пока не открывается. Бот повторит проверку.',
+    'short_link_unresolved':'Не удалось открыть короткую ссылку TikTok. Попробуй указать полную ссылку.',
     'account_assignment_changed':'Назначенные аккаунты изменились',
+    'account_folder_mismatch':'Заказ ждёт настройки папки. На сервере должна быть отдельная папка со всеми аккаунтами этого заказа, без посторонних аккаунтов. Бот проверит папку снова.',
+    'account_check_unavailable':'Не удалось проверить аккаунты и папку на сервере. Бот повторит проверку.',
+    'no_active_accounts':'В пуле заказа нет аккаунтов с активной сессией.',
+    'not_enough_active_accounts':'После проверки доступно меньше аккаунтов, чем указано в настройках заказа.',
     'admin_action_required':'Требуется действие администратора',
     'connection_unavailable':'Сбой соединения с сервером',
     'job_not_found':'Сервер не вернул задачу',
     'execution_failed':'Задача завершилась с ошибкой',
+    'job_duplicate':'Такой заказ уже выполняется в кабинете.',
     'missing_proxies':'Для запуска нужны прокси',
     'accounts_burned':'Аккаунты недоступны',
     'missing_response_id':'Ожидается подтверждение запуска',
@@ -165,16 +202,91 @@ REPORT_REASONS={
 }
 
 
+def error_breakdown(errors:list[dict])->dict[str,int]:
+    grouped={}
+    for item in errors:
+        if not isinstance(item,dict) or not count(item.get('count')):
+            continue
+        code=item.get('code')
+        reason=REPORT_REASONS.get(code,'Другие ошибки') if isinstance(code,str) else 'Другие ошибки'
+        grouped[reason]=grouped.get(reason,0)+count(item['count'])
+    return grouped
+
+
 RESULT_STATUS={
     'live':'Подтверждено','confirmed':'Подтверждено','published':'Опубликовано',
     'success':'Успешно','ok':'Успешно','sent':'Отправлено','pending':'Ожидает подтверждения',
     'moderation':'На модерации','failed':'Ошибка','error':'Ошибка','rejected':'Отклонено',
     'skipped':'Пропущено','existing':'Уже выполнено','collected':'Собрано',
+    'found':'Найдено','candidate':'Кандидат','matched':'Подходит',
+    'done':'Выполнено','partial':'Частично выполнено',
 }
 
 
 def result_status(value:Any)->str:
     return RESULT_STATUS.get(value.lower(),'Статус уточняется') if isinstance(value,str) else 'Статус уточняется'
+
+
+REPLY_CHECK_NOTE=(
+    'Даже если показано «0 ответов», ответы могли опубликоваться. '
+    'Автоматическая проверка может их пропустить. '
+    'Открой исходный комментарий в TikTok и проверь ответы вручную.'
+)
+
+COMMENT_CHECK_NOTE=(
+    'Проверка комментариев очень часто ошибается: зачастую главные комментарии уже есть на видео, '
+    'несмотря на число 0, поэтому желательно проверять комментарии вручную.'
+)
+
+
+def task_has_comments(task:dict)->bool:
+    if task.get('kind')!='publish':
+        return False
+    payload=json.loads(task.get('payload_json') or '{}')
+    assets=payload.get('assets') or {}
+    if assets.get('commentTexts'):
+        return True
+    if payload.get('awemeIds') and not payload.get('replyLinks') and not payload.get('sourceJob'):
+        return True
+    snapshot=json.loads(task.get('snapshot_json') or '{}')
+    if any(count(video.get('comments')) for video in snapshot.get('awemes') or [] if isinstance(video,dict)):
+        return True
+    settings={**(payload.get('settings') or {}),**(snapshot.get('settings') or {})}
+    return bool(count(settings.get('commentsPerVideo')))
+
+
+def task_execution_phase_banner(t:dict)->str:
+    state=t.get('state')
+    if t.get('settle_poll_at') or state not in ('starting','running','paused','stopping'):
+        return ''
+    snapshot=json.loads(t.get('snapshot_json') or '{}')
+    limit_min=task_execution_limit_seconds(t)//60
+    if state=='starting' or (snapshot and snapshot_preparing(snapshot)):
+        return f'Подготовка аккаунтов · таймер выполнения ({minutes_label(limit_min)}) начнётся с начала публикаций.'
+    if t.get('kind') in PUBLICATION_TIMER_KINDS:
+        if not t.get('execution_started_at') and not snapshot_publication_started(snapshot):
+            return f'Ожидание начала выполнения · лимит {minutes_label(limit_min)}.'
+        return f'Публикации начались · лимит выполнения {minutes_label(limit_min)} с начала публикаций.'
+    return ''
+
+
+def task_has_replies(task:dict)->bool:
+    if task.get('kind')=='keyword_reply':
+        return True
+    if task.get('kind')!='publish':
+        return False
+    payload=json.loads(task.get('payload_json') or '{}')
+    assets=payload.get('assets') or {}
+    if assets.get('replyTexts') or any(payload.get(key) for key in ('replyLinks','sourceJob','replyId')):
+        return True
+    snapshot=json.loads(task.get('snapshot_json') or '{}')
+    if any(snapshot.get(key) for key in ('replyLinks','sourceJob','replyByKeywords')):
+        return True
+    if any(count(video.get('replies')) for video in snapshot.get('awemes') or [] if isinstance(video,dict)):
+        return True
+    settings=snapshot.get('settings') or {}
+    return bool((settings.get('useReplyTelegram') and settings.get('telegram'))
+                or (not payload and count(settings.get('repliesPerVideo'))))
 
 
 def report_view(task:dict,report:dict)->tuple[str,str]:
@@ -195,11 +307,19 @@ def report_view(task:dict,report:dict)->tuple[str,str]:
         return rich_table((label,'Успех / попытки','Мод. / ожид.'),
                           [(name,f'{ratio} · {rate}',pending) for name,ratio,rate,pending in rows])
     publication_rows=[summary_row(label,group) for label,group in groups]
+    reply_note=not like_only and (task_has_replies(task) or any(
+        replies.get(key) for key in ('attempts','published','failed','moderation','pending','texts')))
+    comment_note=not like_only and (task_has_comments(task) or any(
+        comm.get(key) for key in ('attempts','published','failed','moderation','pending','texts')))
     table=''
     if publication_rows:
         summary=[('Коммент.' if label=='Комментарии' else label,ratio,rate,pending)
                  for label,ratio,rate,pending in publication_rows]
         table='<h3>Публикации</h3>'+outcome_table('Тип',summary)
+    if comment_note:
+        table+='<p>'+h(COMMENT_CHECK_NOTE)+'</p>'
+    if reply_note:
+        table+='<p>'+h(REPLY_CHECK_NOTE)+'</p>'
     extras=[]
     if l:
         confirmed,total=count(l.get('confirmed')),count(l.get('total'))
@@ -222,23 +342,21 @@ def report_view(task:dict,report:dict)->tuple[str,str]:
         rows=[summary_row(str(t.get('text') or '—')[:155],t) for t in items[:20]]
         footer='<footer>Первые 20 текстов.</footer>' if len(items)>20 else ''
         return '<h3>'+h(label)+'</h3>'+outcome_table('Текст',rows)+footer
-    errors=report.get('errors') or []
+    errors=error_breakdown(report.get('errors') or [])
     error_section=''
     if errors:
-        grouped={}
-        for item in errors:
-            if not isinstance(item,dict):continue
-            code=item.get('code')
-            reason=REPORT_REASONS.get(code,'Другие ошибки') if isinstance(code,str) else 'Другие ошибки'
-            grouped[reason]=grouped.get(reason,0)+count(item.get('count'))
-        error_section='<details><summary>Ошибки · '+number(sum(grouped.values()))+'</summary><ul>'+''.join(
-            '<li>'+h(reason)+' · '+number(total)+'</li>' for reason,total in grouped.items())+'</ul></details>'
+        error_section='<details><summary>Ошибки · '+number(sum(errors.values()))+'</summary><ul>'+''.join(
+            '<li>'+h(reason)+' · '+number(total)+'</li>' for reason,total in errors.items())+'</ul></details>'
     foot='' if like_only else '<footer>Успехами считаются только подтверждённые публикации. Модерация и неподтверждённые отправки в успехи не входят.</footer>'
     rich=head+table+texts(comm,'Тексты комментариев')+texts(replies,'Тексты ответов')+error_section+foot
     plain=(f'<b>{heading}</b>\n<b>{title}</b> · <code>{idtag}</code>\n{h(status)}\n\n'
        +'\n'.join(f'├ {label}: <code>{value}</code> · {rate}\n└ Модерация / ожидают: <code>{pending}</code>'
                  for label,value,rate,pending in publication_rows))
     plain+=''.join(f'\n├ {h(label)}: <code>{h(value)}</code>' for label,value in extras)
+    if comment_note:
+        plain+='\n\n'+h(COMMENT_CHECK_NOTE)
+    if reply_note:
+        plain+='\n\n'+h(REPLY_CHECK_NOTE)
     for label,group in groups:
         items=group.get('texts') or []
         if items:
@@ -252,32 +370,114 @@ def report_view(task:dict,report:dict)->tuple[str,str]:
 
 def task_metrics(t:dict)->list[tuple[str,str]]:
     snapshot=json.loads(t['snapshot_json'] or '{}')
+    preflight=json.loads(t.get('preflight_json') or '{}')
+    names={'publish':'Комментарии и ответы','keyword_reply':'Ответы по ключевым фразам',
+           'fetch':'Сбор комментариев','usernames':'Поиск юзернеймов','feedwarm':'Сбор видео',
+           'commentlike':'Лайки комментариев','check':'Проверка аккаунтов','import':'Импорт аккаунтов'}
+    rows=[('Вид заказа',names.get(t.get('kind'),'Заказ'))]
+    errors=preflight.get('reply_link_error_lines')
+    if isinstance(errors,list) and errors:
+        lines=', '.join(str(line) for line in errors[:10] if type(line) is int)
+        if lines:
+            remaining=f' · ещё {len(errors)-10}' if len(errors)>10 else ''
+            rows.append(('Ошибки в непустых строках',lines+remaining))
+    if t['state']=='queued':
+        stage = {'short_link_retry':'Ожидание повторной проверки ссылки',
+                 'account_folder_mismatch':'Ожидание настройки папки аккаунтов',
+                 'account_check_unavailable':'Ожидание проверки папки аккаунтов'}.get(t.get('error_code'))
+        if not stage:
+            stage = 'Ожидание выбранного времени' if t.get('fire_at') else 'Ожидание свободной очереди кабинета'
+        rows.append(('Этап', stage))
+    phase=preflight.get('phase')
+    if phase=='checking':
+        rows.append(('Аккаунты','Проверка состава папки и сессий'))
+    elif phase=='checked':
+        rows.append(('Готовы к запуску',f'{number(preflight.get("active"))} / {number(preflight.get("requested"))}'))
+        excluded=[(label,count(preflight.get(key))) for key,label in
+                  (('expired','истекли'),('error','ошибка'),('unknown','не проверены'),('missing','не найдены'))]
+        if any(total for _,total in excluded):
+            rows.append(('Без активной сессии',' · '.join(f'{label} {number(total)}' for label,total in excluded if total)))
     if not snapshot:
-        return []
+        if t['state']=='starting':
+            rows.append(('Этап','Подготовка аккаунтов'))
+            rows.append(('Лимит времени',minutes_label(task_execution_limit_seconds(t)//60)))
+        return rows
+    if t['state']=='stopping' and task_finish_pending(snapshot):
+        rows.append(('Этап','Ожидается подтверждение завершения'))
+    elif snapshot.get('state') == 'interrupted':
+        rows.append(('Итог','Выполнение прервано'))
+    elif snapshot.get('state') == 'completed_with_errors':
+        rows.append(('Итог','Завершено с ошибками'))
+    if t.get('settle_poll_at'):
+        rows.append(('Этап','Поздняя проверка публикаций'))
+    elif t['state'] in ('running','paused'):
+        limit_min=task_execution_limit_seconds(t)//60
+        raw_phase=snapshot.get('phase')
+        if snapshot_preparing(snapshot):
+            rows.append(('Этап','Подготовка аккаунтов'))
+            rows.append(('Таймер выполнения',f'Ожидает начала публикаций ({minutes_label(limit_min)})'))
+        else:
+            stage_label=TASK_PHASES.get(raw_phase.lower(),'Выполнение задачи') if isinstance(raw_phase,str) and raw_phase else ''
+            if stage_label:
+                rows.append(('Этап',stage_label))
+            if stage_label!='Публикации начались' and t.get('kind') in PUBLICATION_TIMER_KINDS and (
+                t.get('execution_started_at') or snapshot_publication_started(snapshot)
+            ):
+                rows.append(('Статус публикаций','Публикации начались'))
+            rows.append(('Лимит времени',minutes_label(limit_min)))
     done,total=count(snapshot.get('done')),count(snapshot.get('total'))
-    rows=[('Обработано',f'{number(done)} / {number(total)} · {min(100,100*done//total)}%' if total else number(done))]
+    unit={'fetch':'Видео обработано','usernames':'Видео обработано','feedwarm':'Обработано',
+          'check':'Аккаунтов обработано','import':'Записей обработано'}.get(t.get('kind'),'Действий обработано')
+    rows.append((unit,f'{number(done)} / {number(total)} · {min(100,100*done//total)}%' if total else number(done)))
+    if type(snapshot.get('accountsWorking')) is int:
+        rows.append(('Аккаунтов в работе',number(snapshot['accountsWorking'])))
     fields={
-        'publish':(('published','Подтверждено'),('moderation','На модерации'),('pending','Ожидают подтверждения'),
+        'publish':(('published','Всего подтверждено'),('moderation','На модерации'),('pending','Ожидают подтверждения'),
                    ('attempts','Попыток'),('expired','Сессий истекло'),('webPublications','Через веб')),
-        'keyword_reply':(('published','Подтверждено'),('pending','Ожидают подтверждения'),('attempts','Попыток')),
+        'keyword_reply':(('published','Подтверждено'),('moderation','На модерации'),('pending','Ожидают подтверждения'),('attempts','Попыток')),
         'commentlike':(('liked','Лайков подтверждено'),('likeTotal','Цель'),('likeExisting','Было ранее'),
-                       ('likeAttempts','Попыток'),('likeRetries','Повторов'),('likeUnconfirmed','Не подтверждено')),
+                       ('likeAttempts','Попыток'),('likeRetries','Повторов'),('likeUnconfirmed','Не подтверждено'),
+                       ('likeTargets','Комментариев для лайков'),('likeWaiting','Ожидают'),('likeSkipped','Пропущено')),
         'fetch':(('scanned','Просмотрено'),('collected','Собрано')),
         'usernames':(('scanned','Просмотрено'),('collected','Собрано')),
-        'check':(('checked','Проверено'),('live','Активных'),('expired','Сессий истекло')),
-        'import':(('imported','Импортировано'),('importCreated','Новых'),('importUpdated','Обновлено')),
+        'check':(('checked','Проверено'),('live','Активных'),('expired','Сессий истекло'),('checkRetries','Повторов проверки')),
+        'import':(('imported','Импортировано'),('importCreated','Новых'),('importUpdated','Обновлено'),
+                  ('importWebOnly','Только веб-сессия')),
         'feedwarm':(('scanned','Просмотрено'),('collected','Собрано')),
     }
     kind=t.get('kind')
     rows.extend((label,number(snapshot[key])) for key,label in fields.get(kind,()) if key in snapshot)
+    if kind in ('publish','keyword_reply','commentlike'):
+        for active,assigned,label in (('checkers','checkersTotal','Аккаунты проверки'),
+                                      ('likers','likersTotal','Аккаунты для лайков')):
+            if type(snapshot.get(assigned)) is int and snapshot[assigned]>0:
+                rows.append((label,f'{number(snapshot.get(active))} / {number(snapshot[assigned])}'))
+    if kind in ('publish','keyword_reply'):
+        rows.extend((label,number(snapshot[key])) for key,label in
+                    (('lateConfirmed','Поздние подтверждения'),
+                     ('publishedAfterFinish','Публикации после завершения'))
+                    if type(snapshot.get(key)) is int and snapshot[key]>0)
+    if kind=='publish' and count(snapshot.get('likeTotal')):
+        rows.append(('Лайки комментариев',f'{number(snapshot.get("liked"))} / {number(snapshot["likeTotal"])}'))
     if kind=='publish' and snapshot.get('awemes'):
         videos=[video for video in snapshot['awemes'] if isinstance(video,dict)]
-        rows.append(('Цель выполнена',f'{sum(bool(video.get("goal")) for video in videos)} / {len(videos)} видео'))
+        goals=[video['goal'] for video in videos if type(video.get('goal')) is bool]
+        if goals:rows.append(('Цель выполнена',f'{sum(goals)} / {len(goals)} видео'))
     if kind=='feedwarm' and isinstance(snapshot.get('warm'),dict):
         warm=snapshot['warm']
+        if 'searchMatched' not in warm and warm.get('searchDone') is True and type(warm.get('matched')) is int:
+            warm={**warm,'searchMatched':warm['matched']}
         rows.extend((label,number(warm[key])) for key,label in
                     (('searchScanned','Видео проверено'),('searchMatched','Видео найдено'),
-                     ('scrolled','Просмотрено в ленте')) if key in warm)
+                     ('scrolled','Просмотрено в ленте'),('accountsDone','Аккаунтов завершили'),
+                     ('accounts','Аккаунтов участвуют'),('failed','Ошибок сбора'),
+                     ('shortActions','Действий не выполнено'),('skipped','Пропущено')) if key in warm)
+    if kind=='usernames' and isinstance(snapshot.get('usernameStats'),dict):
+        stats=snapshot['usernameStats']
+        rows.extend((label,number(stats[key])) for key,label in
+                    (('names','Telegram-юзернеймы'),('candidates','Кандидаты'),('mentions','Упоминания'),
+                     ('candidateMentions','Упоминания кандидатов'))
+                    if key in stats)
     if t['state'] in ('completed','stopped','failed','canceled') and snapshot.get('finishedAt'):
         try:
             start=datetime.fromisoformat(snapshot['createdAt'])
@@ -288,29 +488,98 @@ def task_metrics(t:dict)->list[tuple[str,str]]:
             pass
     if kind=='commentlike' and 'likeFailed' in snapshot:
         rows.append(('Ошибок лайков',number(snapshot['likeFailed'])))
+    if kind not in ('publish','check') and type(snapshot.get('expired')) is int:
+        rows.append(('Сессий истекло',number(snapshot['expired'])))
     if 'failed' in snapshot:
         rows.append(('Ошибок',number(snapshot['failed'])))
+    if isinstance(snapshot.get('errorCounts'),list):
+        reasons=error_breakdown(snapshot['errorCounts'])
+        if reasons:
+            rows.append(('Причины',' · '.join(f'{label} {number(total)}' for label,total in reasons.items())))
     return rows
+
+
+def publication_card_rows(task:dict)->list[tuple[str,str,str]]:
+    if task.get('kind') not in ('publish','keyword_reply'):return []
+    snapshot=json.loads(task.get('snapshot_json') or '{}')
+    payload=json.loads(task.get('payload_json') or '{}')
+    settings={**(payload.get('settings') or {}),**(snapshot.get('settings') or {})}
+    videos=[video for video in snapshot.get('awemes') or [] if isinstance(video,dict)]
+    rows=[]
+    for field,label,target in (('comments','Комментарии','commentsPerVideo'),('replies','Ответы','repliesPerVideo')):
+        confirmed=number(sum(count(video.get(field)) for video in videos)) if videos else '—'
+        goal=number(settings[target]) if type(settings.get(target)) is int else '—'
+        rows.append((label,confirmed,goal))
+    return rows
+
+
+def snapshot_timeout(t:dict)->bool:
+    return bool(json.loads(t.get('snapshot_json') or '{}').get('executionTimeLimit'))
+
+
+def empty_video_search(t:dict, *, entry_total:int|None=None)->bool:
+    if t.get('kind')!='feedwarm' or t.get('state')!='completed':
+        return False
+    snapshot=json.loads(t.get('snapshot_json') or '{}')
+    warm=snapshot.get('warm')
+    warm=warm if isinstance(warm,dict) else {}
+    if warm.get('searchDone') is False or count(warm.get('failed')):
+        return False
+    counts = [snapshot.get('collected'), warm.get('searchMatched'), entry_total]
+    if warm.get('searchDone') is True:
+        counts.append(warm.get('matched'))
+    known = [value for value in counts if type(value) is int and value >= 0]
+    return bool(known) and max(known) == 0
 
 
 def task_view(t:dict)->str:
     body=(f'<b>▣ {h(t["display_name"])}</b> · <code>{h(t["task_id"])}</code>\n'
           f'<b>{state_symbol(t["state"])} {state_label(t["state"])}</b>\n')
+    if banner:=task_execution_phase_banner(t):body+='\n<b>'+h(banner)+'</b>\n'
+    if empty_video_search(t):body+='\nНичего не нашлось. Измени тему поиска и создай новый сбор.\n'
+    if t.get('state')=='queued':body+='\nЗаказ поставлен в очередь. Он начнётся, когда освободится исполнитель.\n'
     rows=task_metrics(t)
     for index,(label,value) in enumerate(rows):
         branch='└' if index==len(rows)-1 else '├'
         body+=f'\n{branch} {h(label)}: <code>{h(value)}</code>'
     if t.get('error_code'):
         body+='\n\n'+h(ERROR_LABELS.get(t['error_code'],'Состояние требует проверки.'))
+    publications=publication_card_rows(t)
+    if publications:
+        body+='\n\n<b>Публикации</b>'
+        body+=''.join(f'\n{h(label)} · подтверждено <b>{confirmed}</b> · цель на видео {goal}'
+                      for label,confirmed,goal in publications)
+        body+='\nСчётчик обработанных действий включает попытки отправки.'
+    if task_has_comments(t):
+        body+='\n\n'+h(COMMENT_CHECK_NOTE)
+    if task_has_replies(t):
+        body+='\n\n'+h(REPLY_CHECK_NOTE)
     return body
 
 
 def task_rich(t:dict,details:tuple[tuple[str,Any],...]=())->str:
     head=(f'<h2>▣ {h(t["display_name"])}</h2>'
-          f'<p><code>{h(t["task_id"])}</code> · <b>{state_symbol(t["state"])} {state_label(t["state"])}</b></p>')
+          f'<p><b>{state_symbol(t["state"])} {state_label(t["state"])}</b></p>')
+    if banner:=task_execution_phase_banner(t):head+='<p><b>'+h(banner)+'</b></p>'
+    if empty_video_search(t):head+='<p>Ничего не нашлось. Измени тему поиска и создай новый сбор.</p>'
+    if t.get('state')=='queued':head+='<p>Заказ поставлен в очередь. Он начнётся, когда освободится исполнитель.</p>'
     rows=[*task_metrics(t),*details]
+    publications=publication_card_rows(t)
+    if publications:
+        head+='<h3>Публикации</h3>'+rich_table(('Тип','Подтверждено','Цель на видео'),publications)
     if rows:
         head+=rich_table(('Показатель','Значение'),rows)
+    if publications:
+        head+='<footer>Счётчик обработанных действий включает попытки отправки.</footer>'
+    if task_has_comments(t):
+        head+='<p>'+h(COMMENT_CHECK_NOTE)+'</p>'
     if t.get('error_code'):
         head+='<footer>'+h(ERROR_LABELS.get(t['error_code'],'Состояние требует проверки.'))+'</footer>'
+    if snapshot_timeout(t):
+        limit_sec=json.loads(t.get('snapshot_json') or '{}').get('executionLimitSeconds') or task_execution_limit_seconds(t)
+        limit_min=max(1,int(limit_sec)//60)
+        head+=f'<footer>Заказ остановлен по лимиту выполнения ({minutes_label(limit_min)}).</footer>'
+    if task_has_replies(t):
+        head+='<details><summary>Как считаются ответы</summary><p>'+h(REPLY_CHECK_NOTE)+'</p></details>'
+    head+='<footer>Заказ · <code>'+h(t['task_id'])+'</code></footer>'
     return head

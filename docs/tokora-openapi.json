@@ -253,6 +253,63 @@
         ],
         "type": "object"
       },
+      "AccountFolder": {
+        "properties": {
+          "active": {
+            "type": "integer"
+          },
+          "count": {
+            "type": "integer"
+          },
+          "createdAt": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "count",
+          "active",
+          "createdAt"
+        ],
+        "type": "object"
+      },
+      "AccountFolderList": {
+        "properties": {
+          "available": {
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AccountFolder"
+            },
+            "type": "array"
+          },
+          "total": {
+            "type": "integer"
+          },
+          "unassigned": {
+            "type": "integer"
+          },
+          "unassignedActive": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "unassigned",
+          "unassignedActive",
+          "total",
+          "available"
+        ],
+        "type": "object"
+      },
       "AccountImport": {
         "properties": {
           "cookies": {
@@ -273,6 +330,41 @@
         },
         "required": [
           "cookies"
+        ],
+        "type": "object"
+      },
+      "AccountImportCheck": {
+        "properties": {
+          "accountId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exists": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "hidden": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "uid": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "uid",
+          "exists",
+          "accountId",
+          "hidden"
         ],
         "type": "object"
       },
@@ -321,6 +413,18 @@
             "type": "integer"
           },
           "checked": {
+            "type": "integer"
+          },
+          "checkerFolder": {
+            "type": "string"
+          },
+          "checkerFolderName": {
+            "type": "string"
+          },
+          "checkers": {
+            "type": "integer"
+          },
+          "checkersTotal": {
             "type": "integer"
           },
           "collected": {
@@ -377,6 +481,9 @@
           "kind": {
             "type": "string"
           },
+          "lateConfirmed": {
+            "type": "integer"
+          },
           "likeActive": {
             "type": "integer"
           },
@@ -419,6 +526,21 @@
           "liked": {
             "type": "integer"
           },
+          "likerFolder": {
+            "type": "string"
+          },
+          "likerFolderName": {
+            "type": "string"
+          },
+          "likers": {
+            "type": "integer"
+          },
+          "likersOnly": {
+            "type": "boolean"
+          },
+          "likersTotal": {
+            "type": "integer"
+          },
           "live": {
             "type": "integer"
           },
@@ -441,6 +563,9 @@
             "type": "integer"
           },
           "published": {
+            "type": "integer"
+          },
+          "publishedAfterFinish": {
             "type": "integer"
           },
           "replyByKeywords": {
@@ -476,6 +601,12 @@
           },
           "settings": {
             "$ref": "#/components/schemas/TaskSettings"
+          },
+          "settleUntil": {
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "shadow": {
             "type": "integer"
@@ -725,6 +856,12 @@
               "null"
             ]
           },
+          "proxyId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "proxySource": {
             "type": [
               "string",
@@ -754,6 +891,7 @@
           "profile",
           "proxy",
           "proxySource",
+          "proxyId",
           "device",
           "createdAt",
           "updatedAt"
@@ -2286,6 +2424,37 @@
         ],
         "type": "object"
       },
+      "ProxyBalance": {
+        "properties": {
+          "hasPackage": {
+            "type": "boolean"
+          },
+          "limitBytes": {
+            "type": "integer"
+          },
+          "percentUsed": {
+            "type": "integer"
+          },
+          "remainingBytes": {
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          },
+          "usedBytes": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "hasPackage",
+          "limitBytes",
+          "usedBytes",
+          "remainingBytes",
+          "percentUsed",
+          "status"
+        ],
+        "type": "object"
+      },
       "ProxyCheckRequest": {
         "properties": {
           "ids": {
@@ -3129,6 +3298,18 @@
           "checked": {
             "type": "integer"
           },
+          "checkerFolder": {
+            "type": "string"
+          },
+          "checkerFolderName": {
+            "type": "string"
+          },
+          "checkers": {
+            "type": "integer"
+          },
+          "checkersTotal": {
+            "type": "integer"
+          },
           "collected": {
             "type": "integer"
           },
@@ -3187,6 +3368,9 @@
           "kind": {
             "type": "string"
           },
+          "lateConfirmed": {
+            "type": "integer"
+          },
           "likeActive": {
             "type": "integer"
           },
@@ -3229,6 +3413,21 @@
           "liked": {
             "type": "integer"
           },
+          "likerFolder": {
+            "type": "string"
+          },
+          "likerFolderName": {
+            "type": "string"
+          },
+          "likers": {
+            "type": "integer"
+          },
+          "likersOnly": {
+            "type": "boolean"
+          },
+          "likersTotal": {
+            "type": "integer"
+          },
           "live": {
             "type": "integer"
           },
@@ -3251,6 +3450,9 @@
             "type": "integer"
           },
           "published": {
+            "type": "integer"
+          },
+          "publishedAfterFinish": {
             "type": "integer"
           },
           "replyByKeywords": {
@@ -3289,6 +3491,12 @@
           },
           "settings": {
             "$ref": "#/components/schemas/TaskSettings"
+          },
+          "settleUntil": {
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "shadow": {
             "type": "integer"
@@ -3626,6 +3834,9 @@
           "replyMethod": {
             "type": "string"
           },
+          "settleMinutes": {
+            "type": "integer"
+          },
           "telegram": {
             "type": "string"
           },
@@ -3682,7 +3893,8 @@
           "likeEnabled",
           "likesPerComment",
           "likesPerReply",
-          "lastFetchKeywords"
+          "lastFetchKeywords",
+          "settleMinutes"
         ],
         "type": "object"
       },
@@ -3823,6 +4035,12 @@
               "null"
             ]
           },
+          "settleMinutes": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "telegram": {
             "type": [
               "string",
@@ -3888,6 +4106,9 @@
             },
             "type": "array"
           },
+          "checkerFolder": {
+            "type": "string"
+          },
           "disableCommentPhotos": {
             "type": "boolean"
           },
@@ -3915,6 +4136,12 @@
           },
           "likeSourceJob": {
             "type": "string"
+          },
+          "likerFolder": {
+            "type": "string"
+          },
+          "likersOnly": {
+            "type": "boolean"
           },
           "likesPerComment": {
             "type": "integer"
@@ -4013,6 +4240,18 @@
           "checked": {
             "type": "integer"
           },
+          "checkerFolder": {
+            "type": "string"
+          },
+          "checkerFolderName": {
+            "type": "string"
+          },
+          "checkers": {
+            "type": "integer"
+          },
+          "checkersTotal": {
+            "type": "integer"
+          },
           "collected": {
             "type": "integer"
           },
@@ -4061,6 +4300,9 @@
           "kind": {
             "type": "string"
           },
+          "lateConfirmed": {
+            "type": "integer"
+          },
           "likeActive": {
             "type": "integer"
           },
@@ -4103,6 +4345,21 @@
           "liked": {
             "type": "integer"
           },
+          "likerFolder": {
+            "type": "string"
+          },
+          "likerFolderName": {
+            "type": "string"
+          },
+          "likers": {
+            "type": "integer"
+          },
+          "likersOnly": {
+            "type": "boolean"
+          },
+          "likersTotal": {
+            "type": "integer"
+          },
           "live": {
             "type": "integer"
           },
@@ -4125,6 +4382,9 @@
             "type": "integer"
           },
           "published": {
+            "type": "integer"
+          },
+          "publishedAfterFinish": {
             "type": "integer"
           },
           "replyByKeywords": {
@@ -4160,6 +4420,12 @@
           },
           "settings": {
             "$ref": "#/components/schemas/TaskSettings"
+          },
+          "settleUntil": {
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "shadow": {
             "type": "integer"
@@ -4605,9 +4871,65 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/v1/account-folders": {
+      "get": {
+        "description": "Папки кабинета со счётчиками аккаунтов (count — всего, active — с рабочей сессией) и аккаунты без папки (unassigned). Создание, переименование и перенос аккаунтов — на сайте.\n\nПраво: `accounts:read`.",
+        "operationId": "getAccountFolders",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountFolderList"
+                }
+              }
+            },
+            "description": "Успешно",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        },
+        "security": [
+          {
+            "apiKey": [
+              "accounts:read"
+            ]
+          }
+        ],
+        "summary": "Папки аккаунтов",
+        "tags": [
+          "accounts"
+        ],
+        "x-description-en": "Workspace folders with account counters (count — total, active — with a working session) and accounts without a folder (unassigned). Creating, renaming and moving accounts is done on the website.",
+        "x-scope": "accounts:read",
+        "x-subscription": false,
+        "x-summary-en": "Account folders"
+      }
+    },
     "/v1/accounts": {
       "get": {
-        "description": "Право: `accounts:read`.",
+        "description": "Право: `accounts:read`. Коды ошибок операции: `job_not_found`.",
         "operationId": "getAccounts",
         "parameters": [
           {
@@ -4655,6 +4977,26 @@
             "required": false,
             "schema": {
               "maxLength": 100,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Только аккаунты папки: id папки (8 hex), none — без папки, all или пусто — все. Папка задачи — поле accountFolder задания",
+            "in": "query",
+            "name": "folder",
+            "required": false,
+            "schema": {
+              "pattern": "^([0-9a-f]{8}|none|all)$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Аккаунты набора задания (ID задания): движок набирает аккаунты по папке задания (accountFolder; пусто — все) и вычитает пулы «Чекеры»/«Лайкеры». Это текущий состав папки — движок не отдаёт снимок набора на момент старта (его размер — accountsAssigned задания). Вместе с folder нельзя",
+            "in": "query",
+            "name": "task",
+            "required": false,
+            "schema": {
+              "pattern": "^[0-9a-f]{32}$",
               "type": "string"
             }
           }
@@ -4977,6 +5319,92 @@
         "x-scope": "accounts:write",
         "x-subscription": true,
         "x-summary-en": "Import an account from cookies"
+      }
+    },
+    "/v1/accounts/import/check": {
+      "post": {
+        "description": "Тело — как у POST /v1/accounts/import (нужны только cookies). Ничего не импортирует и не ходит в TikTok. Аккаунт определяется по UID TikTok — тому же признаку, по которому импорт находит существующую запись. UID берётся из cookie multi_sids (пара с cookie sessionid). exists=true — аккаунт уже в кабинете, импорт обновит его сессию и ответит 200; exists=false — импорт создаст новый (201); exists=null — UID из cookies не определить (reason=uid_not_in_cookies), дубль выяснится только при импорте. hidden=true — аккаунт удалён на сайте, импорт вернёт его в список.\n\nПраво: `accounts:read`.",
+        "operationId": "postAccountsImportCheck",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "example": {
+                "cookies": [
+                  {
+                    "domain": ".tiktok.com",
+                    "name": "sessionid",
+                    "value": "…"
+                  },
+                  {
+                    "domain": ".tiktok.com",
+                    "name": "multi_sids",
+                    "value": "7300000000000000000%3A…"
+                  }
+                ]
+              },
+              "schema": {
+                "$ref": "#/components/schemas/AccountImport"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "accountId": "acc_0123456789abcdef0123456789abcdef",
+                  "exists": true,
+                  "hidden": false,
+                  "uid": "7300000000000000000"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/AccountImportCheck"
+                }
+              }
+            },
+            "description": "Успешно",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        },
+        "security": [
+          {
+            "apiKey": [
+              "accounts:read"
+            ]
+          }
+        ],
+        "summary": "Проверить дубль до импорта",
+        "tags": [
+          "accounts"
+        ],
+        "x-description-en": "Body is the same as POST /v1/accounts/import (only cookies are used). Imports nothing and makes no TikTok requests. An account is identified by its TikTok UID — the same key import uses to find an existing record. The UID is taken from the multi_sids cookie (the pair matching the sessionid cookie). exists=true — the account is already in the workspace, import will update its session and return 200; exists=false — import will create a new one (201); exists=null — the UID cannot be read from the cookies (reason=uid_not_in_cookies), a duplicate is only found on import. hidden=true — the account was removed on the website, import will bring it back.",
+        "x-scope": "accounts:read",
+        "x-subscription": false,
+        "x-summary-en": "Check for a duplicate before import"
       }
     },
     "/v1/accounts/import/file": {
@@ -10114,6 +10542,70 @@
         "x-summary-en": "Add proxies from lines"
       }
     },
+    "/v1/proxies/balance": {
+      "get": {
+        "description": "Общий остаток купленных пакетов кабинета — сумма по всем пакетам, в байтах. Только числа: адреса, реквизиты и отдельные прокси пакета не отдаются. status: ok | low (мало осталось) | exhausted (трафик кончился) | none (пакетов нет). Срока у пакета нет — трафик по времени не сгорает. Обновляется раз в 30 с.\n\nПраво: `proxies:read`.",
+        "operationId": "getProxiesBalance",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "hasPackage": true,
+                  "limitBytes": 10737418240,
+                  "percentUsed": 30,
+                  "remainingBytes": 7516192768,
+                  "status": "ok",
+                  "usedBytes": 3221225472
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ProxyBalance"
+                }
+              }
+            },
+            "description": "Успешно",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        },
+        "security": [
+          {
+            "apiKey": [
+              "proxies:read"
+            ]
+          }
+        ],
+        "summary": "Остаток пакета «Прокси Tokora»",
+        "tags": [
+          "proxies"
+        ],
+        "x-description-en": "Total balance of the workspace's purchased packages — the sum over all packages, in bytes. Numbers only: addresses, credentials and individual package proxies are not returned. status: ok | low (running low) | exhausted (no traffic left) | none (no packages). Packages have no expiry — traffic does not burn out over time. Refreshed every 30 s.",
+        "x-scope": "proxies:read",
+        "x-subscription": false,
+        "x-summary-en": "Tokora proxy package balance"
+      }
+    },
     "/v1/proxies/check": {
       "delete": {
         "description": "Право: `proxies:write`. Нужна активная подписка (иначе 402 subscription_required).",
@@ -10870,6 +11362,9 @@
                   "replyMethod": {
                     "type": "string"
                   },
+                  "settleMinutes": {
+                    "type": "integer"
+                  },
                   "telegram": {
                     "type": "string"
                   },
@@ -11170,7 +11665,7 @@
         "x-summary-en": "List tasks"
       },
       "post": {
-        "description": "Идемпотентно по requestId: повтор с тем же requestId вернёт то же задание (200). Без прокси — 400 missing_proxies.\n\nПраво: `tasks:write`. Нужна активная подписка (иначе 402 subscription_required). Коды ошибок операции: `missing_proxies`, `accounts_burned`, `invalid_job`, `job_busy`, `request_conflict`.",
+        "description": "Идемпотентно по requestId: повтор с тем же requestId вернёт то же задание (200). Без прокси — 400 missing_proxies. Аккаунты задания — по папке: accountFolder (id папки, none — без папки, пусто — все аккаунты кабинета); assets.accountIds не учитывается. Аккаунты набора запущенного задания — GET /v1/accounts?task=<id>.\n\nПраво: `tasks:write`. Нужна активная подписка (иначе 402 subscription_required). Коды ошибок операции: `missing_proxies`, `accounts_burned`, `invalid_job`, `job_busy`, `request_conflict`.",
         "operationId": "postTasks",
         "requestBody": {
           "content": {
@@ -11265,7 +11760,7 @@
         "tags": [
           "tasks"
         ],
-        "x-description-en": "Idempotent by requestId: a repeat with the same requestId returns the same task (200). Without proxies — 400 missing_proxies.",
+        "x-description-en": "Idempotent by requestId: a repeat with the same requestId returns the same task (200). Without proxies — 400 missing_proxies. Task accounts are chosen by folder: accountFolder (folder ID, none — no folder, empty — all workspace accounts); assets.accountIds is ignored. Accounts of a started task's set — GET /v1/accounts?task=<id>.",
         "x-scope": "tasks:write",
         "x-subscription": true,
         "x-summary-en": "Start a task"

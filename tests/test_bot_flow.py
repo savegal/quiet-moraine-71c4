@@ -5,14 +5,12 @@ from proxima_bot.db import Store
 from proxima_bot.bot import BotApp
 
 class TelegramStub:
-    def __init__(self):self.sent=[];self.invoices=[];self.prechecks=[]
+    def __init__(self):self.sent=[]
     async def send(self,uid,text,keyboard=None,**kw):
         self.sent.append((uid,text,keyboard))
     async def rich(self,uid,rich,plain,keyboard=None):
         self.sent.append((uid,rich,keyboard))
     async def answer_callback(self,callback_id,text=''):pass
-    async def invoice(self,uid,payload,stars,days):self.invoices.append((uid,payload,stars,days))
-    async def precheckout(self,qid,ok,reason=''):self.prechecks.append((qid,ok,reason))
 
 class ApiStub:
     async def resolve(self,url):return '7420000000000000000'
@@ -41,25 +39,6 @@ def test_telegram_wizard_creates_isolated_queue():
     asyncio.run(run())
 
 
-def test_precheckout_rejects_fake_amount_and_payment_idempotent():
-    async def run():
-        cfg=Config('fake','fake',99,stars_price=123)
-        db=Store(':memory:');tg=TelegramStub();app=BotApp(cfg,db,tg,ApiStub())
-        db.register(7)
-        await app.callback(7,{'data':'buy'})
-        payload=tg.invoices[-1][1]
-        await app.handle({'pre_checkout_query':{'id':'q1','from':{'id':7},'invoice_payload':payload,'currency':'XTR','total_amount':122}})
-        assert tg.prechecks[-1][1] is False
-        await app.handle({'pre_checkout_query':{'id':'q2','from':{'id':7},'invoice_payload':payload,'currency':'XTR','total_amount':123}})
-        assert tg.prechecks[-1][1] is True
-        payment={'chat':{'type':'private'},'from':{'id':7},'successful_payment':{
-          'invoice_payload':payload,'currency':'XTR','total_amount':123,'telegram_payment_charge_id':'paid-1'}}
-        await app.handle({'message':payment})
-        exp=db.user(7)['expires_at']
-        await app.handle({'message':payment})
-        assert db.user(7)['expires_at']==exp
-        db.close()
-    asyncio.run(run())
 
 
 def test_expired_user_can_open_existing_task():
@@ -71,4 +50,48 @@ def test_expired_user_can_open_existing_task():
         await app.handle({'callback_query':{'id':'callback','from':{'id':7},'message':{'chat':{'type':'private'}},'data':'task:'+tid}})
         assert 'old' in tg.sent[-1][1]
         db.close()
+    asyncio.run(run())
+
+
+def test_handle_overlaps_answer_callback_with_callback_work():
+    from proxima_bot.api import TelegramError
+
+    async def run():
+        cfg = Config('fake', 'fake', 99)
+        db = Store(':memory:')
+        db.assign(7, 'a')
+        tid = db.queue_task(7, 'overlap-task', 'publish', {'assets': {'accountIds': ['a']}})
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        finished = asyncio.Event()
+
+        class BlockingAnswerTG(TelegramStub):
+            async def answer_callback(self, callback_id, text=''):
+                started.set()
+                await release.wait()
+                finished.set()
+                raise TelegramError(400, 'query is too old')
+
+        tg = BlockingAnswerTG()
+        app = BotApp(cfg, db, tg, ApiStub())
+        orig_callback = app.callback
+
+        async def wrapped_callback(uid, cb):
+            assert started.is_set()
+            assert not finished.is_set()
+            await orig_callback(uid, cb)
+            release.set()
+
+        app.callback = wrapped_callback
+        try:
+            await asyncio.wait_for(
+                app.handle({'callback_query': {'id': 'cb1', 'from': {'id': 7}, 'message': {'chat': {'type': 'private'}}, 'data': 'task:' + tid}}),
+                timeout=1.0,
+            )
+            assert finished.is_set()
+            assert 'overlap-task' in tg.sent[-1][1]
+        finally:
+            db.close()
+
     asyncio.run(run())

@@ -1,4 +1,9 @@
-from proxima_bot.presentation import BUTTON_SYMBOLS, days_label, pagination, report_view, keyboard, h, task_view
+import json
+
+from proxima_bot.presentation import (
+    BUTTON_SYMBOLS, ERROR_LABELS, REPLY_CHECK_NOTE, REPORT_REASONS,
+    days_label, pagination, report_view, keyboard, h, task_rich, task_view,
+)
 from proxima_bot.bot import links,safe_api_error
 import pytest
 
@@ -14,6 +19,23 @@ def test_rich_report_html_table_and_sanitization():
     assert '&lt;b&gt;injection&lt;/b&gt;' in rich
     assert '7 / 10' in rich
     assert '7 / 10' in plain
+    assert all(REPLY_CHECK_NOTE in view for view in (rich,plain))
+
+
+@pytest.mark.parametrize(('kind','payload','snapshot','show_note'), [
+    ('publish',{'assets':{'replyTexts':['Ответ']}},{'published':0},True),
+    ('publish',{'replyLinks':['video:comment']},{'published':0},True),
+    ('publish',{'sourceJob':'collection'},{'published':0},True),
+    ('publish',{}, {'settings':{'repliesPerVideo':1}},True),
+    ('keyword_reply',{}, {},True),
+    ('publish',{'assets':{'commentTexts':['Комментарий']}},{'settings':{'repliesPerVideo':1}},False),
+    ('fetch',{'settings':{'includeReplies':True}}, {'collected':2},False),
+])
+def test_reply_check_notice_for_cards_and_reports(kind,payload,snapshot,show_note):
+    task={'display_name':'Задача','task_id':'abcdef12','state':'completed','kind':kind,
+          'payload_json':json.dumps(payload),'snapshot_json':json.dumps(snapshot)}
+    views=(task_view(task),task_rich(task),*report_view(task,{'replies':{'published':0,'attempts':0}}))
+    assert all((REPLY_CHECK_NOTE in view)==show_note for view in views)
 
 
 def test_keyboard_colors_and_safety():
@@ -46,3 +68,29 @@ def test_no_raw_upstream_error_to_worker():
 def test_task_view_escapes_name():
     obj={'display_name':'<a href="evil">','task_id':'12345678','state':'queued','snapshot_json':'{}','error_code':''}
     assert '<a href="evil">' not in task_view(obj)
+
+
+def test_order_card_separates_confirmed_comments_and_replies_from_processed_actions():
+    task={'display_name':'Публикация','task_id':'abcd1234','kind':'publish','state':'running',
+          'snapshot_json':json.dumps({'state':'running','phase':'likes','done':160,'total':160,
+              'published':17,'attempts':274,'settings':{'commentsPerVideo':80,'repliesPerVideo':80},
+              'awemes':[{'comments':17,'replies':0}]}),'error_code':''}
+    rich=task_rich(task)
+    assert '<td>Комментарии</td><td>17</td><td>80</td>' in rich
+    assert '<td>Ответы</td><td>0</td><td>80</td>' in rich
+    assert 'Лайки комментариев' in rich and 'Цель выполнена' not in rich
+    assert 'попытки отправки' in rich
+    assert 'Комментарии' in task_view(task) and '274' in task_view(task)
+
+
+def test_error_labels_and_cards_do_not_expose_upstream_brand():
+    for mapping in (ERROR_LABELS, REPORT_REASONS):
+        for code, text in mapping.items():
+            assert 'tokora' not in text.casefold()
+            assert 'токор' not in text.casefold()
+    for code in ('external_pool_unknown', 'invalid_target', 'account_folder_mismatch', 'account_check_unavailable'):
+        task = {'display_name': 'Заказ', 'task_id': 'abcd1234', 'kind': 'publish', 'state': 'queued',
+                'snapshot_json': '{}', 'error_code': code}
+        for rendered in (task_view(task), task_rich(task)):
+            assert 'tokora' not in rendered.casefold()
+            assert ERROR_LABELS[code] in rendered

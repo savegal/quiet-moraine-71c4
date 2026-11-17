@@ -8,5 +8,6 @@ __pycache__/
 data/
 private/
 *.sqlite3*
+*.keys
 *.tmp
 *.zip

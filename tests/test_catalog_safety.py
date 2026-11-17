@@ -1,14 +1,18 @@
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
+from proxima_bot import api as api_module
+from proxima_bot.api import ApiError, Tokora
 from proxima_bot.catalog import (
     build_payload,
     parse_comment_links,
     parse_feedwarm,
     parse_options,
     parse_targets,
+    resolve_payload_targets,
     validate_feedwarm,
     validate_task_options,
 )
@@ -68,7 +72,8 @@ def test_local_task_limits_do_not_change_general_owner_settings():
 def test_keyword_reply_targets_cannot_be_changed_in_extra_options():
     async def run():
         api = Provider()
-        draft = {'name': 'Тест', 'keywords': ['выбранная фраза'], 'replies': ['Ответ']}
+        draft = {'name': 'Тест', 'videos': ['7420000000000000000'],
+                 'keywords': ['выбранная фраза'], 'replies': ['Ответ']}
         with pytest.raises(ValueError, match='fetchKeywords'):
             await build_payload(api, 'keyword_reply', {**draft, 'options': {
                 'fetchKeywords': ['другая фраза'],
@@ -77,6 +82,28 @@ def test_keyword_reply_targets_cannot_be_changed_in_extra_options():
         assert payload['settings']['fetchKeywords'] == ['выбранная фраза']
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(('disabled', 'comments', 'replies'), [
+    ('comments', [], ['Ответ']),
+    ('replies', ['Комментарий'], []),
+])
+def test_publish_payload_drops_stale_texts_from_disabled_blocks(disabled, comments, replies):
+    draft = {'name': 'Старый черновик', 'videos': ['7420000000000000000'],
+             'comments': ['Комментарий'], 'replies': ['Ответ'], 'disabled_fields': [disabled]}
+    payload = asyncio.run(build_payload(Provider(), 'publish', draft, ['acc'], defer_resolution=True))
+    assert payload['assets'] == {'accountIds': ['acc'], 'commentTexts': comments, 'replyTexts': replies}
+
+
+@pytest.mark.parametrize('mode', ['reply_links', 'keyword_reply'])
+@pytest.mark.parametrize('material', [{}, {'replies': ['Старый текст'], 'disabled_fields': ['replies']}])
+def test_reply_order_requires_enabled_texts_before_target_resolution(mode, material):
+    provider = Provider()
+    draft = {'name': 'Старый черновик', 'videos': ['https://vt.tiktok.com/example/'],
+             'reply_links': ['https://vt.tiktok.com/example/'], 'keywords': ['Фраза'], **material}
+    with pytest.raises(ValueError, match='Добавь тексты ответов'):
+        asyncio.run(build_payload(provider, mode, draft, ['acc']))
+    assert not provider.calls
 
 
 def test_video_id_in_query_is_not_used_as_the_actual_target():
@@ -98,5 +125,39 @@ def test_old_feedwarm_draft_is_revalidated_before_dispatch():
                 'name': 'Тест', 'warm_json': {'sampleLinks': ['http://127.0.0.1/private']},
             }, ['acc'])
         assert not api.calls
+
+    asyncio.run(run())
+
+
+def test_rate_limited_video_batch_reuses_previous_valid_resolutions(monkeypatch):
+    links = [f'https://vt.tiktok.com/link-{index}/' for index in range(3)]
+    ids = [str(7420000000000000000 + index) for index in range(3)]
+    clock = SimpleNamespace(now=0)
+    monkeypatch.setattr(api_module, 'time', SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(api_module, 'TOKORA_REQUESTS_PER_MINUTE', 2)
+
+    async def run():
+        api = Tokora(None, 'https://example.invalid', 'unused')
+        calls = []
+
+        async def call(method, path, *, payload, retries):
+            assert (method, path) == ('POST', '/v1/links/resolve')
+            await api.reserve_request()
+            target = payload['link']
+            calls.append(target)
+            return {'videoId': ids[links.index(target)]}
+
+        api.call = call
+        order = {'awemeIds': links}
+        with pytest.raises(ApiError, match='rate_limited'):
+            await resolve_payload_targets(api, order)
+        assert calls == links[:2]
+        clock.now = 61
+        assert await resolve_payload_targets(api, order) == {'awemeIds': ids}
+        assert calls == links
+
+        clock.now += api_module.VIDEO_RESOLUTION_CACHE_TTL
+        assert await api.resolve(links[0]) == ids[0]
+        assert calls == [*links, links[0]]
 
     asyncio.run(run())

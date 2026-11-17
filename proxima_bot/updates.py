@@ -1,16 +1,18 @@
-"""Durable Telegram intake with independent payment and chat processing."""
+"""Durable Telegram intake with ordered processing per chat actor."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import re
 import time
 
 from .api import TelegramError
 
 log = logging.getLogger(__name__)
-LANE_LIMITS = {'checkout': 8, 'payment': 4, 'chat': 8}
+CHAT_CONCURRENCY = 8
 OFFSET_IDLE_LIMIT = 7*86400-60
+TOKEN_TEXT = re.compile(r'tk_[A-Za-z0-9_-]{12,}')
 
 
 class UpdateInbox:
@@ -18,12 +20,12 @@ class UpdateInbox:
         self.app = app
         self.conn = app.db.conn
         self.changed = asyncio.Event()
-        self.active = {lane: set() for lane in LANE_LIMITS}
+        self.active: set[int] = set()
+        self.private_updates: dict[int, dict] = {}
         self.conn.executescript('''
             CREATE TABLE IF NOT EXISTS telegram_inbox (
                 update_id INTEGER PRIMARY KEY, lane TEXT NOT NULL, actor INTEGER NOT NULL,
-                payload TEXT NOT NULL, received REAL NOT NULL, retry_at REAL NOT NULL DEFAULT 0,
-                attempts INTEGER NOT NULL DEFAULT 0, started INTEGER NOT NULL DEFAULT 0
+                payload TEXT NOT NULL, received REAL NOT NULL, started INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS telegram_inbox_actor ON telegram_inbox(lane,actor,update_id);
         ''')
@@ -34,27 +36,41 @@ class UpdateInbox:
             log.warning('Interrupted chat updates require checking their outcome: %d',interrupted)
 
     @staticmethod
-    def route(update: dict) -> tuple[str, int]:
-        checkout = update.get('pre_checkout_query')
-        if checkout:
-            return 'checkout',int(checkout['from']['id'])
+    def actor(update: dict) -> int:
         message = update.get('message') or {}
-        if message.get('successful_payment') or message.get('refunded_payment'):
-            actor = (message.get('chat') or {}).get('id') or (message.get('from') or {}).get('id') or 0
-            return 'payment',int(actor)
         sender = ((update.get('callback_query') or message).get('from') or {}).get('id')
-        return 'chat',int(sender or 0)
+        return int(sender or 0)
 
     def persist(self, updates: list[dict]) -> int:
         offset = max(update['update_id'] for update in updates)+1
         received = time.time()
+        credential_command = getattr(self.app, 'credential_command', '')
+        private = {}
         self.conn.execute('BEGIN IMMEDIATE')
         try:
             for update in updates:
-                lane,actor = self.route(update)
-                self.conn.execute('''INSERT OR IGNORE INTO telegram_inbox(update_id,lane,actor,payload,received)
-                                     VALUES (?,?,?,?,?)''',
-                                  (update['update_id'],lane,actor,json.dumps(update,ensure_ascii=False),received))
+                actor = self.actor(update)
+                if not actor:continue
+                message = update.get('message') or {}
+                text = message.get('text') or ''
+                words = text.split(maxsplit=1)
+                is_owner = credential_command and actor == self.app.cfg.owner_id
+                is_credential = credential_command and words and (
+                    words[0].split('@', 1)[0].lower() == credential_command
+                    or (is_owner and TOKEN_TEXT.search(text)))
+                # Keep the owner's submission in memory. The durable copy is safe to replay after a crash.
+                safe = update
+                if is_credential:
+                    safe = {**update, 'message': {**message, 'text': credential_command}}
+                payload = json.dumps(safe, ensure_ascii=False)
+                if is_credential or is_owner:
+                    payload = TOKEN_TEXT.sub('[ключ скрыт]', payload)
+                result = self.conn.execute('''INSERT OR IGNORE INTO telegram_inbox(update_id,lane,actor,payload,received)
+                                     VALUES (?,'chat',?,?,?)''',
+                                  (update['update_id'],actor,payload,received))
+                if (result.rowcount and is_credential and is_owner
+                        and (message.get('chat') or {}).get('type') == 'private'):
+                    private[update['update_id']] = update
             self.app.db.update_offset(offset)
             self.conn.execute("""INSERT INTO metadata(key,value) VALUES ('telegram_offset_at',?)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value""",(str(received),))
@@ -62,6 +78,7 @@ class UpdateInbox:
         except Exception:
             self.conn.execute('ROLLBACK')
             raise
+        self.private_updates.update(private)
         self.changed.set()
         return offset
 
@@ -84,38 +101,26 @@ class UpdateInbox:
                 log.exception('Telegram update intake failed')
                 await asyncio.sleep(3)
 
-    def ready(self, lane: str, limit: int):
-        excluded = self.active[lane]
+    def ready(self, limit: int):
+        excluded = self.active
         placeholders = ','.join('?' for _ in excluded)
         skip = f' AND item.actor NOT IN ({placeholders})' if excluded else ''
         return self.conn.execute('''SELECT item.* FROM telegram_inbox item
-            WHERE item.lane=? AND item.started=0 AND item.retry_at<=?'''+skip+'''
+            WHERE item.lane='chat' AND item.started=0'''+skip+'''
             AND NOT EXISTS (SELECT 1 FROM telegram_inbox earlier WHERE earlier.lane=item.lane
                             AND earlier.actor=item.actor AND earlier.update_id<item.update_id)
-            ORDER BY item.update_id LIMIT ?''',(lane,time.time(),*excluded,limit)).fetchall()
+            ORDER BY item.update_id LIMIT ?''',(*excluded,limit)).fetchall()
 
     async def process(self, row) -> None:
-        uid,lane,update_id = row['actor'],row['lane'],row['update_id']
+        uid,update_id = row['actor'],row['update_id']
         try:
-            if lane=='chat':
-                self.conn.execute('UPDATE telegram_inbox SET started=1 WHERE update_id=?',(update_id,))
-                await self.app.handle_chat_update(json.loads(row['payload']))
-            else:
-                await self.app.handle(json.loads(row['payload']))
+            self.conn.execute('UPDATE telegram_inbox SET started=1 WHERE update_id=?',(update_id,))
+            update = self.private_updates.pop(update_id, None)
+            await self.app.handle_chat_update(update if update is not None else json.loads(row['payload']))
         except Exception as exc:
-            log.warning('Telegram %s update %d failed: %s',lane,update_id,type(exc).__name__)
-            retry_payment = lane=='payment'
-            retry_checkout = (lane=='checkout' and time.time()-row['received']<8
-                              and (not isinstance(exc,TelegramError) or exc.code>=500 or exc.code==429))
-            if retry_payment or retry_checkout:
-                delay=min(60,2**min(row['attempts'],6)) if retry_payment else 0.5
-                if isinstance(exc,TelegramError):
-                    delay=max(delay,exc.retry_after)
-                self.conn.execute('UPDATE telegram_inbox SET attempts=attempts+1,retry_at=? WHERE update_id=?',
-                                  (time.time()+delay,update_id))
-                return
+            log.warning('Telegram chat update %d failed: %s',update_id,type(exc).__name__)
         finally:
-            self.active[lane].discard(uid)
+            self.active.discard(uid)
             self.changed.set()
         self.conn.execute('DELETE FROM telegram_inbox WHERE update_id=?',(update_id,))
 
@@ -124,12 +129,11 @@ class UpdateInbox:
             tasks.create_task(self.poll())
             while True:
                 self.changed.clear()
-                for lane,capacity in LANE_LIMITS.items():
-                    available = capacity-len(self.active[lane])
-                    if available:
-                        for row in self.ready(lane,available):
-                            self.active[lane].add(row['actor'])
-                            tasks.create_task(self.process(row))
+                available = CHAT_CONCURRENCY-len(self.active)
+                if available:
+                    for row in self.ready(available):
+                        self.active.add(row['actor'])
+                        tasks.create_task(self.process(row))
                 try:
                     await asyncio.wait_for(self.changed.wait(),timeout=0.5)
                 except TimeoutError:

@@ -1,5 +1,6 @@
 """Owner console permission, idempotency, subscription and usability regression tests."""
 import asyncio
+from dataclasses import replace
 import tempfile
 from pathlib import Path
 import pytest
@@ -16,6 +17,7 @@ class TG:
 
 class API:
     def __init__(self):self.calls=[]
+    async def account_page(self,offset,limit=200,**kwargs):return {'accounts':[],'total':0}
     async def call(self,method,path,**kwargs):
         self.calls.append((method,path))
         return {'id':'remote1'}
@@ -34,6 +36,9 @@ def fresh():
     return app
 
 def run(coro):return asyncio.run(coro)
+
+def callbacks(app):
+    return {button['callback_data'] for row in app.tg.sent[-1][2]['inline_keyboard'] for button in row}
 
 def test_schema_migrates_existing_db_and_name_search_cyrillic():
     with tempfile.TemporaryDirectory() as tmp:
@@ -109,6 +114,45 @@ def test_subscription_rejects_an_id_outside_sqlite_range():
     run(f())
 
 
+def test_order_mode_settings_use_explicit_owner_confirmation():
+    async def f():
+        app=fresh()
+        try:
+            app.cfg=replace(app.cfg,restricted_modes=('feedwarm',))
+            await app.callback(99,{'data':'admin'})
+            assert 'adm:modes' in callbacks(app)
+            await app.callback(99,{'data':'adm:modes'})
+            assert {'adm:mode:feedwarm:0','adm:mode:reply_links:1'} <= callbacks(app)
+            assert not any(route.startswith('adm:mode:check:') for route in callbacks(app))
+            await app.callback(7,{'data':'adm:mode:feedwarm:0'})
+            assert app.db.draft(7) is None
+
+            await app.callback(99,{'data':'adm:mode:feedwarm:0'})
+            cancel=next(route for route in callbacks(app) if route.startswith('adm:modecancel:'))
+            await app.callback(99,{'data':cancel})
+            assert app.db.draft(99) is None and app.mode_restricted(7,'feedwarm')
+
+            await app.callback(99,{'data':'adm:mode:feedwarm:0'})
+            confirm=next(route for route in callbacks(app) if route.startswith('adm:modeapply:'))
+            await app.callback(7,{'data':confirm})
+            assert app.mode_restricted(7,'feedwarm')
+            await app.callback(99,{'data':confirm})
+            await app.callback(99,{'data':confirm})
+            assert not app.mode_restricted(7,'feedwarm')
+            assert app.db.order_mode_access()=={'feedwarm':False}
+            assert sum(row['action']=='order_mode_allow' for row in app.db.audit_entries())==1
+
+            await app.callback(99,{'data':'adm:mode:reply_links:1'})
+            confirm=next(route for route in callbacks(app) if route.startswith('adm:modeapply:'))
+            await app.callback(99,{'data':confirm})
+            assert app.mode_restricted(7,'source_reply')
+            assert not app.mode_restricted(99,'source_reply')
+            assert app.mode_restricted(7,'check')
+        finally:
+            app.db.close()
+    run(f())
+
+
 def test_assignment_explains_unready_session():
     async def f():
         app=fresh()
@@ -166,6 +210,119 @@ def test_custom_grant_limits_and_daily_quota():
         a.db.close()
     run(f())
 
+
+def test_assign_command_requires_confirmation_and_writes_audit():
+    async def f():
+        app=fresh()
+
+        async def fetch_account(method,path,**kwargs):
+            assert (method,path)==('GET','/v1/accounts/smoke-account')
+            return {'accountId':'smoke-account','status':'active'}
+
+        app.api.call=fetch_account
+        await app.command(99,'/assign 99 smoke-account')
+        assert app.db.account_ids(99)==[]
+        nonce=app.db.draft(99)['data']['nonce']
+        await app.callback(99,{'data':'adm:apply:'+nonce})
+        assert app.db.account_ids(99)==['smoke-account']
+        assert app.db.audit_entries()[0]['action']=='assign_account'
+        await app.command(99,'/unassign 99 smoke-account')
+        assert app.db.account_ids(99)==['smoke-account']
+        nonce=app.db.draft(99)['data']['nonce']
+        await app.callback(99,{'data':'adm:apply:'+nonce})
+        assert app.db.account_ids(99)==[]
+        assert app.db.audit_entries()[0]['action']=='unassign_account'
+        app.db.close()
+    run(f())
+
+
+def test_bulk_assignment_keeps_other_members_accounts_and_skips_inactive():
+    async def f():
+        app=fresh()
+        occupied=[f'owned-{index}' for index in range(200)]
+        app.db.assign_available_accounts(8,occupied)
+        requested=[]
+
+        async def provider(method,path,**kwargs):
+            assert (method,path)==('GET','/v1/accounts')
+            assert kwargs['params']['status']=='active'
+            offset=kwargs['params']['offset']
+            requested.append(offset)
+            if offset==0:return {'accounts':[{'accountId':aid,'status':'active'} for aid in occupied]}
+            return {'accounts':[{'accountId':'available','status':'active'},
+                                {'accountId':'expired','status':'expired'}]}
+
+        app.api.call=provider
+        await app.callback(99,{'data':'adm:edit:assign_batch:7:300'})
+        assert not requested
+        confirm='adm:apply:'+app.db.draft(99)['data']['nonce']
+        await app.callback(7,{'data':confirm})
+        assert not requested
+        await app.callback(99,{'data':confirm})
+        await app.callback(99,{'data':confirm})
+        assert requested==[0,200]
+        assert app.db.account_ids(7)==['acc7','available']
+        assert set(occupied).issubset(app.db.account_ids(8))
+        assert '1 / 300' in app.tg.sent[-1][1]
+        assert app.db.audit_entries()[0]['action']=='assign_batch'
+        app.db.close()
+    run(f())
+
+
+def test_owner_callback_routes_survive_reopening_database(tmp_path):
+    async def f():
+        location=str(tmp_path/'bot.sqlite3')
+        config=Config('bot','upstream',99)
+        oid='a'*110
+        db=ExtendedStore(location)
+        app=ProximaApp(config,db,TG(),API())
+        markup=app.owner_keyboard([('◇ Аккаунт','account:'+oid,None)])
+        opaque=markup['inline_keyboard'][0][0]['callback_data']
+        assert opaque.startswith('route:') and len(opaque.encode())<=64
+        db.close()
+
+        db=ExtendedStore(location)
+        app=ProximaApp(config,db,TG(),API())
+        await app.callback(7,{'data':opaque})
+        assert app.api.calls==[]
+        await app.callback(99,{'data':opaque})
+        assert app.api.calls==[('GET','/v1/accounts/'+oid)]
+        db.close()
+    run(f())
+
+
+def test_owner_controls_update_state_immediately_and_member_cannot_pause():
+    async def f():
+        app=fresh()
+        tid=app.db.queue_task(7,'Заказ','publish',{'assets':{'accountIds':['acc7']}})
+        app.db.transition(tid,'running',upstream_id='remote')
+        calls=[]
+
+        async def provider(method,path,**kwargs):
+            calls.append((method,path))
+            state='paused' if path.endswith('/pause') else 'running'
+            return {'id':'remote','state':state}
+
+        app.api.call=provider
+        await app.task(7,tid)
+        member_markup=app.tg.sent[-1][2]
+        assert all('pause:' not in button['callback_data'] for row in member_markup['inline_keyboard'] for button in row)
+        await app.callback(7,{'data':'pause:'+tid})
+        assert calls==[]
+        await app.callback(99,{'data':'adm:control:pause:'+tid})
+        assert app.db.task(tid)['state']=='paused'
+        assert 'На паузе' in app.tg.sent[-1][1]
+        await app.callback(99,{'data':'adm:control:resume:'+tid})
+        assert app.db.task(tid)['state']=='running'
+        assert 'В работе' in app.tg.sent[-1][1]
+        job=app.db.task(tid)
+        assert app.save_verified_snapshot(job,{'id':'remote','state':'done','finishedAt':'2026-11-16T16:00:00Z'})
+        assert app.db.task(tid)['state']=='completed'
+        assert not app.save_verified_snapshot(job,{'id':'remote','state':'error'})
+        assert app.db.task(tid)['state']=='completed'
+        app.db.close()
+    run(f())
+
 def test_owner_sees_all_orders_and_can_cancel_with_confirm():
     async def f():
         a=fresh();d=a.db
@@ -198,13 +355,91 @@ def test_long_account_id_and_read_only_exports():
         a.db.close()
     run(f())
 
-def test_payment_event_recorded_once():
-    a=fresh();d=a.db
-    invoice=d.create_invoice(7,50)
-    assert d.paid_invoice(7,invoice,50,'xtr-charge',30)
-    assert d.paid_invoice(7,invoice,50,'xtr-charge',30) is None
-    assert len([e for e in d.subscriptions(7) if e['action']=='stars'])==1
-    d.close()
+
+def test_owner_can_open_member_results_and_csv_from_the_admin_card():
+    async def f():
+        app=fresh()
+        tid=app.db.queue_task(8,'Сбор команды','fetch',{
+            'assets':{'accountIds':['acc8']},'awemeIds':['7000000000000000000']})
+        app.db.transition(tid,'paused',upstream_id='remote-collection')
+        requests=[]
+
+        async def provider(method,path,**kwargs):
+            requests.append((method,path))
+            assert method=='GET' and path=='/v1/tasks/remote-collection/entries'
+            return {'total':1,'offset':0,'more':False,'items':[{'kind':'comment','text':'Тестовая строка'}]}
+
+        app.api.call=provider
+        try:
+            await app.callback(99,{'data':'adm:job:'+tid})
+            assert {'entries:'+tid,'exports:'+tid,'videos:'+tid,'collected:'+tid,
+                    'task_accounts:remote-collection:0'} <= callbacks(app)
+            assert 'adm:report:'+tid not in callbacks(app)
+            await app.callback(7,{'data':'entries:'+tid})
+            assert not requests
+            await app.callback(99,{'data':'entries:'+tid})
+            assert 'Тестовая строка' in app.tg.sent[-1][1]
+            assert 'adm:job:'+tid in callbacks(app)
+            await app.callback(99,{'data':'videos:'+tid})
+            assert 'tiktok.com' in app.tg.sent[-1][1]
+            assert 'adm:job:'+tid in callbacks(app)
+            await app.callback(99,{'data':'exports:'+tid})
+            assert 'export_csv:'+tid in callbacks(app)
+            await app.callback(99,{'data':'export_csv:'+tid})
+            assert 'Тестовая строка' in app.tg.files[-1][1].decode('utf-8-sig')
+        finally:
+            app.db.close()
+    run(f())
+
+
+def test_owner_queue_includes_paused_and_stopping_orders():
+    async def f():
+        app=fresh()
+        try:
+            cases=(('На паузе','paused',7,'acc7'),('Остановка','stopping',8,'acc8'))
+            ids=[]
+            for name,state,uid,account in cases:
+                tid=app.db.queue_task(uid,name,'publish',{'assets':{'accountIds':[account]}})
+                app.db.transition(tid,state,upstream_id='up-'+tid)
+                ids.append(tid)
+            await app.callback(99,{'data':'adm:liveq:0'})
+            assert {'adm:job:'+tid for tid in ids} <= callbacks(app)
+            assert '2 / 0' in app.tg.sent[-1][1]
+            await app.callback(99,{'data':'adm:jobs:stopping:0'})
+            assert 'adm:job:'+ids[1] in callbacks(app)
+            assert 'adm:job:'+ids[0] not in callbacks(app)
+        finally:
+            app.db.close()
+    run(f())
+
+
+def test_owner_cabinet_links_and_folder_pagination():
+    async def f():
+        app=fresh()
+
+        async def provider(method,path,**kwargs):
+            assert (method,path)==('GET','/v1/account-folders')
+            return {'available':True,'items':[{'id':f'{i:08x}','name':f'Папка {i}'} for i in range(1,27)]}
+
+        app.api.call=provider
+        try:
+            await app.callback(99,{'data':'adm:api'})
+            assert {'settings','materials'} <= callbacks(app)
+            await app.callback(99,{'data':'settings'})
+            assert {'owner_show:settings','owner_edit:settlement'} <= callbacks(app)
+            await app.callback(99,{'data':'materials'})
+            assert 'owner_show:asset_comments' in callbacks(app)
+            await app.callback(99,{'data':'adm:foldersync:7'})
+            for i in (1,2):
+                route=f'adm:foldersync:7:{i}'
+                assert route in callbacks(app)
+                await app.callback(99,{'data':route})
+            assert 'adm:fsp:7:0000001a' in callbacks(app)
+            assert 'adm:foldersync:7:3' not in callbacks(app)
+        finally:
+            app.db.close()
+    run(f())
+
 
 def test_contact_profile_is_updated_on_message():
     async def f():
@@ -213,4 +448,100 @@ def test_contact_profile_is_updated_on_message():
                                   'chat':{'type':'private'},'text':'/start'}})
         assert a.db.user(18)['username']=='worker18'
         a.db.close()
+    run(f())
+
+
+def test_photo_toggle_shared_templates_live_queue_folder_sync_and_pool_summary():
+    async def f():
+        a=fresh()
+        try:
+            # 1. Per-user photo access toggle
+            assert not a.allow_photos(7)
+            assert a.allow_photos(99)
+            await a.callback(99,{'data':'adm:toggle_photo:7'})
+            assert a.allow_photos(7)
+            assert 'Включены' in a.tg.sent[-1][1]
+            await a.callback(7,{'data':'adm:toggle_photo:7'})
+            assert a.allow_photos(7)  # non-owner cannot toggle
+            await a.callback(99,{'data':'adm:toggle_photo:7'})
+            assert not a.allow_photos(7)
+
+            # 2. Shared templates: member can read/use owner's shared template, cannot edit/delete
+            tid=a.db.save_template(99,'Общий пресет','publish',{'comments':['Привет'], 'replies':['Да']})
+            await a.callback(99,{'data':f'tpl_share:{tid}'})
+            assert a.db.template(99,tid)['is_shared']
+            assert any(t['template_id']==tid for t in a.db.templates(7))
+            assert a.db.template(7,tid)['template_id']==tid
+            assert a.db.template(7,tid,owned_only=True) is None
+            await a.callback(7,{'data':f'tpl:{tid}'})
+            assert 'Общий' in a.tg.sent[-1][1]
+            assert 'tpl_delete:' not in str(a.tg.sent[-1][2])
+            await a.callback(7,{'data':f'tpl_delete_confirm:{tid}'})
+            assert a.db.template(99,tid) is not None
+
+            # 3. Live queue & dispatch pause toggle
+            job_id=a.db.queue_task(7,'Очередь тест','publish',{'assets':{'accountIds':['acc7']},'awemeIds':['1']})
+            await a.callback(99,{'data':'adm:qpause:on'})
+            assert a.db.dispatch_paused()
+            assert 'На паузе' in a.tg.sent[-1][1]
+            await a.callback(99,{'data':'adm:liveq:0'})
+            assert 'Очередь тест' in a.tg.sent[-1][1]
+            await a.callback(99,{'data':'adm:lqpause:off'})
+            assert not a.db.dispatch_paused()
+            a.db.cancel_queued(job_id,7)
+
+            # 4. 1-click folder sync (add free & exact 1-in-1) + pool_summary + folder-aware assign_batch
+            async def api_call(method,path,**kwargs):
+                if path=='/v1/account-folders':
+                    return {'available':True,'unassigned':1,'items':[{'id':'1234abcd','name':'Траф7','count':3,'active':3}]}
+                if path=='/v1/accounts':
+                    return {'accounts':[
+                        {'accountId':'acc7','status':'active','folderId':'1234abcd'},
+                        {'accountId':'f1','status':'active','folderId':'1234abcd'},
+                        {'accountId':'f2','status':'active','folderId':'1234abcd'},
+                        {'accountId':'other_folder','status':'active','folderId':'9999ffff'},
+                    ],'total':4}
+                return {}
+
+            async def in_folder(fid):
+                assert fid=='1234abcd'
+                return {
+                    'f1':{'accountId':'f1','status':'active','folderId':fid},
+                    'acc8':{'accountId':'acc8','status':'active','folderId':fid},
+                    'other_busy':{'accountId':'other_busy','status':'active','folderId':fid},
+                }
+
+            async def account_page(offset,limit=200,**kwargs):
+                return {'accounts':[
+                    {'accountId':'f1','status':'active','folderId':'1234abcd'},
+                    {'accountId':'other_busy','status':'active','folderId':'1234abcd'},
+                ],'total':2}
+
+            a.api.call=api_call
+            a.api.accounts_in_folder=in_folder
+            a.api.account_page=account_page
+
+            await a.callback(99,{'data':'adm:foldersync:7'})
+            assert 'Траф7' in str(a.tg.sent[-1][2])
+            await a.callback(99,{'data':'adm:fsp:7:1234abcd'})
+            assert 'Свободных для добавления' in a.tg.sent[-1][1]
+            await a.callback(99,{'data':'adm:fsg:7:1234abcd:e'})
+            assert set(a.db.account_ids(7))=={'f1','other_busy'}
+            assert a.db.account_ids(8)==['acc8']
+            assert 'Синхронизация выполнена частично' in a.tg.sent[-1][1]
+
+            # pool_summary exposes folder consistency to owner
+            await a.pool_summary(99,7)
+            assert 'Папки в кабинете' in a.tg.sent[-1][1] and '1234abcd' in a.tg.sent[-1][1]
+
+            # assign_batch stays within user's existing folder
+            a.db.unassign(7,'f1')
+            a.db.unassign(7,'other_busy')
+            a.db.assign(7,'acc7')
+            added=await a.assign_batch(7,5)
+            assert added==2
+            assert set(a.db.account_ids(7))=={'acc7','f1','f2'}
+            assert 'other_folder' not in a.db.account_ids(7)
+        finally:
+            a.db.close()
     run(f())
