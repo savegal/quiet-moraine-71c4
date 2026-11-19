@@ -135,7 +135,8 @@ def test_main_menu_fallback_on_api_error():
         # Even with failed API, get_main_menu_data should not raise
         metrics = await app.get_main_menu_data(uid=7)
         assert metrics['total_accounts'] == 2
-        assert metrics['available_accounts'] == 2
+        assert metrics['available_accounts'] is None
+        assert 'доступно —' in app.format_main_menu(metrics)
         assert metrics['comments_today'] == 0
         assert metrics['total_published'] == 0
 
@@ -143,7 +144,7 @@ def test_main_menu_fallback_on_api_error():
         assert len(app.tg.out) == 1
         text = app.tg.out[0][1]
         assert '<h2>🏠 Главное меню</h2>' in text
-        assert 'Аккаунты · <b>2</b> · доступно <b>2</b>' in text
+        assert 'Аккаунты · <b>2</b> · доступно <b>—</b>' in text
         assert '<b>0</b> комментариев · <b>0</b> ответов' in text
         assert 'Всего опубликовано · <b>0</b>' in text
 

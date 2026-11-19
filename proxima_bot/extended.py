@@ -2229,7 +2229,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             await self.say(uid,'Ошибка: '+detail)
         return True
 
-    async def owner_go(self,uid:int,key:str,confirmed:bool=False):
+    async def owner_go(self,uid:int,key:str,nonce:str|None=None):
         if not self.owner(uid):return
         if key=='proxies_check':
             return await self.start_proxy_check(uid)
@@ -2238,21 +2238,22 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if key not in ADMIN_ACTIONS and key not in ('accounts_check','accounts_check_stop'):return
         stop_data = None
         if key in DESTRUCTIVE:
-            if not confirmed:
-                confirmation = {'action':key}
+            if nonce is None:
+                confirmation = {}
                 if key=='accounts_check_stop':
                     status = await read_workspace_account_check(self.api,self.db)
                     if not self.account_check_active(status):
                         return await self.live_cards.open_account_check(uid,status)
                     confirmation.update(marker=self.db.account_check_marker(),started_at=status.get('startedAt'))
-                self.db.save_draft(uid,'owner_confirmation','confirm',confirmation)
+                nonce = self.save_owner_confirmation(uid,key,**confirmation)
                 return await self.say(uid,'<b>Подтверждение</b>\n\nДействие <code>'+h(key)+'</code> может изменить общий кабинет.',keyboard(
-                    [('× Да, выполнить','owner_confirm:'+key,'danger')],
-                    [('↶ Отмена','discard',None)]))
-            draft = self.db.draft(uid)
-            if not self.consume_owner_confirmation(uid,key):return
+                    [('× Да, выполнить',f'owner_confirm:{key}:{nonce}','danger')],
+                    [('↶ Отмена','owner_cancel:'+nonce,None)]))
+            confirmation = self.consume_owner_confirmation(uid,nonce,action=key)
+            if confirmation is None:
+                return
             if key=='accounts_check_stop':
-                stop_data = draft['data']
+                stop_data = confirmation
                 if 'marker' not in stop_data or 'started_at' not in stop_data:
                     return await self.owner_show(uid,'accounts_check')
         if key in ('accounts_check','accounts_check_stop'):
@@ -2273,13 +2274,21 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         self.db.log(uid,key)
         await self.say(uid,'✓ Операция выполнена.\n'+h(key),keyboard([('↶ Администратор','admin',None)]))
 
-    def consume_owner_confirmation(self,uid:int,action:str,oid:str='')->bool:
+    def save_owner_confirmation(self,uid:int,action:str,oid:str='',**details)->str:
+        nonce = token_hex(6)
+        self.db.save_draft(uid,'owner_confirmation','confirm',{'action':action,'id':oid,'nonce':nonce,**details})
+        return nonce
+
+    def consume_owner_confirmation(self,uid:int,nonce:str,*,action:str|None=None)->dict|None:
         draft=self.db.draft(uid)
-        if not (draft and draft['mode']=='owner_confirmation' and time.time()-draft['updated_at']<=600
-                and draft['data'].get('action')==action and draft['data'].get('id','')==oid):
-            return False
+        if not (draft and draft['mode']=='owner_confirmation' and draft['step']=='confirm'
+                and time.time()-draft['updated_at']<=600):
+            return None
+        data = draft['data']
+        if data.get('nonce')!=nonce or (action is not None and data.get('action')!=action):
+            return None
         self.db.clear_draft(uid)
-        return True
+        return data
 
     async def owner_action(self,uid:int,action:str,oid:str):
         if not self.owner(uid):return
@@ -2490,7 +2499,17 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if action.startswith('owner_go:'):
             return await self.owner_go(uid,action[9:])
         if action.startswith('owner_confirm:'):
-            return await self.owner_go(uid,action[14:],confirmed=True)
+            key, sep, nonce = action.removeprefix('owner_confirm:').partition(':')
+            if sep and key in DESTRUCTIVE:
+                return await self.owner_go(uid,key,nonce)
+            return
+        if action.startswith('owner_cancel:') and self.owner(uid):
+            confirmation = self.consume_owner_confirmation(uid,action.removeprefix('owner_cancel:'))
+            if confirmation is None:
+                return
+            if confirmation['action']=='posttpl_delete':
+                return await self.owner_show(uid,'post_templates')
+            return await self.show_home(uid)
         if action.startswith('upload:'):
             return await self.upload_intro(uid,action[7:])
         if action.startswith('account:'):
@@ -2619,20 +2638,23 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
                     detail='Будет поставлено в очередь · <b>'+number(plan['postsTotal'])+'</b> публикаций.'
                 elif internal=='post_retry':
                     detail+='\nПри повторной публикации существует риск дубля.'
-                self.db.save_draft(uid,'owner_confirmation','confirm',{'action':internal,'id':oid})
+                nonce = self.save_owner_confirmation(uid,internal,oid)
                 return await self.say(uid,'<b>'+h(label)+'</b>\n\n'+detail,self.owner_keyboard(
-                    [('✓ Подтверждаю','owner_do:'+internal+':'+oid,'danger' if internal!='plan_launch' else 'success')],
-                    [('↶ Отмена','discard',None)]))
+                    [('✓ Подтверждаю',f'owner_do:{internal}:{nonce}','danger' if internal!='plan_launch' else 'success')],
+                    [('↶ Отмена','owner_cancel:'+nonce,None)]))
         if action.startswith('owner_do:') and self.owner(uid):
-            fields=action.split(':',2)
-            if len(fields)==3 and self.consume_owner_confirmation(uid,fields[1],fields[2]):
-                if fields[1]=='photo_delete':
-                    target,oid=fields[2][:2],fields[2][2:]
-                    if target not in ('r:','c:') or not SAFE_ID.fullmatch(oid):return
-                    await self.api.call('DELETE','/v1/photos/'+pth_id(oid),params={'target':'replies' if target=='r:' else 'comments'},retries=0)
-                    self.db.log(uid,'photo_delete',oid)
-                    return await self.say(uid,'✓ Фото удалено.')
-                return await self.owner_action(uid,fields[1],fields[2])
+            key, _, nonce = action.removeprefix('owner_do:').partition(':')
+            confirmation = self.consume_owner_confirmation(uid,nonce,action=key)
+            if confirmation is None:
+                return
+            oid = confirmation['id']
+            if key=='photo_delete':
+                target,oid=oid[:2],oid[2:]
+                if target not in ('r:','c:') or not SAFE_ID.fullmatch(oid):return
+                await self.api.call('DELETE','/v1/photos/'+pth_id(oid),params={'target':'replies' if target=='r:' else 'comments'},retries=0)
+                self.db.log(uid,'photo_delete',oid)
+                return await self.say(uid,'✓ Фото удалено.')
+            return await self.owner_action(uid,key,oid)
         return await super().callback(uid,query)
 
     async def handle(self,update:dict)->None:
@@ -2765,12 +2787,14 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if data.startswith('posttpl_delete_confirm:') and self.owner(uid):
             oid=data[23:]
             if not SAFE_ID.fullmatch(oid):return
-            self.db.save_draft(uid,'owner_confirmation','confirm',{'action':'posttpl_delete','id':oid})
+            nonce = self.save_owner_confirmation(uid,'posttpl_delete',oid)
             return await self.say(uid,'Удалить шаблон подписи <code>'+h(oid)+'</code>?',self.owner_keyboard(
-                [('× Удалить','posttpl_delete:'+oid,'danger')],[('↶ Отмена','owner_show:post_templates',None)]))
+                [('× Удалить','posttpl_delete:'+nonce,'danger')],[('↶ Отмена','owner_cancel:'+nonce,None)]))
         if data.startswith('posttpl_delete:') and self.owner(uid):
-            oid=data[15:]
-            if not SAFE_ID.fullmatch(oid) or not self.consume_owner_confirmation(uid,'posttpl_delete',oid):return
+            confirmation = self.consume_owner_confirmation(uid,data.removeprefix('posttpl_delete:'),action='posttpl_delete')
+            if confirmation is None:
+                return
+            oid = confirmation['id']
             await self.api.call('DELETE','/v1/posts/templates/'+pth_id(oid),retries=0)
             self.db.log(uid,'posttpl_delete',oid)
             return await self.say(uid,'✓ Шаблон подписи удалён.')

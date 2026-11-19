@@ -123,9 +123,37 @@ def test_non_admin_cannot_edit_shared_media():
         assert not app.api.calls
         await app.callback(99,{'data':'owner_go:posts_clear_history'})
         assert not app.api.calls
-        await app.callback(99,{'data':'owner_confirm:posts_clear_history'})
+        await app.callback(99,{'data':button_callback(app,'owner_confirm:posts_clear_history:')})
         assert app.api.calls[-1][1]=='/v1/posts/queue/clear-history'
         app.db.close()
+    asyncio.run(run())
+
+
+def test_old_owner_confirmation_and_cancel_cannot_affect_a_new_prompt():
+    async def run():
+        app = new_app()
+        try:
+            prompt = {'data':'owner_go:posts_clear_history'}
+            await app.callback(99,prompt)
+            previous_confirm = button_callback(app,'owner_confirm:posts_clear_history:')
+            previous_cancel = button_callback(app,'owner_cancel:')
+
+            await app.callback(99,prompt)
+            current_confirm = button_callback(app,'owner_confirm:posts_clear_history:')
+            await app.callback(99,{'data':previous_confirm})
+            await app.callback(99,{'data':previous_cancel})
+            assert not app.api.calls
+
+            await app.callback(99,{'data':current_confirm})
+            assert app.api.calls[-1][1]=='/v1/posts/queue/clear-history'
+            await app.callback(99,prompt)
+            current_confirm = button_callback(app,'owner_confirm:posts_clear_history:')
+            current_cancel = button_callback(app,'owner_cancel:')
+            await app.callback(99,{'data':current_cancel})
+            await app.callback(99,{'data':current_confirm})
+            assert sum(path=='/v1/posts/queue/clear-history' for _,path,*_ in app.api.calls)==1
+        finally:
+            app.db.close()
     asyncio.run(run())
 
 

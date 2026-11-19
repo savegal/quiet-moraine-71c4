@@ -316,6 +316,9 @@ def test_owner_controls_update_state_immediately_and_member_cannot_pause():
         assert app.db.task(tid)['state']=='running'
         assert 'В работе' in app.tg.sent[-1][1]
         job=app.db.task(tid)
+        assert app.save_verified_snapshot(job,{'id':'remote','state':'running','done':5})
+        assert not app.save_verified_snapshot(job,{'id':'remote','state':'running','done':2})
+        job=app.db.task(tid)
         assert app.save_verified_snapshot(job,{'id':'remote','state':'done','finishedAt':'2026-11-16T16:00:00Z'})
         assert app.db.task(tid)['state']=='completed'
         assert not app.save_verified_snapshot(job,{'id':'remote','state':'error'})

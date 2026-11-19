@@ -1,5 +1,6 @@
 import asyncio
 import json
+from contextlib import closing
 from hashlib import blake2s
 from types import SimpleNamespace
 import pytest
@@ -63,6 +64,31 @@ def test_worker_dispatch_and_completion():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize('response', [
+    {'id':'job1','state':'running','done':2}, ApiError('job_not_found',404),
+])
+def test_late_poll_does_not_replace_a_newer_snapshot(response):
+    async def run():
+        with closing(Store(':memory:')) as db:
+            db.grant(7,30)
+            db.assign(7,'acc7')
+            tid = db.queue_task(7,'Сбор','fetch',{'assets':{'accountIds':['acc7']}})
+            db.transition(tid,'running',upstream_id='job1',snapshot={'id':'job1','state':'running','done':1})
+            api = FakeTokora()
+            api.final['job1'] = response
+            worker = Worker(db,api,FakeTelegram(),Config('fake','fake',99))
+            previous = db.task(tid)
+            latest = {'id':'job1','state':'running','done':5}
+            db.transition(tid,'running',snapshot=latest)
+
+            await worker.refresh_job(previous)
+
+            current = db.task(tid)
+            assert current['state']=='running'
+            assert json.loads(current['snapshot_json'])==latest
+    asyncio.run(run())
+
+
 def test_two_slots_skip_an_overlapping_order_and_count_remote_and_local_only_once():
     class Provider(FakeTokora):
         async def start(self, payload):
@@ -80,7 +106,8 @@ def test_two_slots_skip_an_overlapping_order_and_count_remote_and_local_only_onc
             second = db.queue_task(8, 'Другой пул', 'fetch', {'assets': {'accountIds': ['b']}})
             third = db.queue_task(9, 'Третий пул', 'fetch', {'assets': {'accountIds': ['c']}})
             api = Provider()
-            worker = Worker(db, api, FakeTelegram(), Config('fake', 'fake', 99, dispatch_enabled=True))
+            cfg = Config('fake', 'fake', 99, dispatch_enabled=True, max_active_external=2)
+            worker = Worker(db, api, FakeTelegram(), cfg)
             await worker.tick()
             assert not db.claim_start(overlap, 'queued', 99, max_active=2)
             api.active = [{'id': 'job-1', 'state': 'running'}]
@@ -498,8 +525,11 @@ def test_config_supports_higher_concurrency_and_restricted_modes(monkeypatch):
     monkeypatch.setenv('TELEGRAM_BOT_TOKEN', '123:test')
     monkeypatch.setenv('TOKORA_API_KEY', 'key')
     monkeypatch.setenv('OWNER_ID', '99')
-    monkeypatch.setenv('MAX_ACTIVE_TASKS', '4')
+    monkeypatch.delenv('MAX_ACTIVE_TASKS', raising=False)
     monkeypatch.setenv('RESTRICTED_MODES', 'fetch, feedwarm, fetch')
+    assert Config.from_env().max_active_external == 5
+
+    monkeypatch.setenv('MAX_ACTIVE_TASKS', '4')
     cfg = Config.from_env()
     assert cfg.max_active_external == 4
     assert cfg.restricted_modes == ('fetch', 'feedwarm')

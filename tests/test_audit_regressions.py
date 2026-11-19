@@ -245,7 +245,8 @@ def test_main_menu_empty_assigned_accounts_dict_reports_zero_available():
             app.api.account_page = failing_page
             app.api.call = failing_call
             fallback = await app.get_main_menu_data(9)
-            assert fallback['available_accounts'] == 2
+            assert fallback['total_accounts'] == 2
+            assert fallback['available_accounts'] is None
         finally:
             app.db.close()
 

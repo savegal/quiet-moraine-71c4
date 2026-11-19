@@ -149,7 +149,8 @@ def test_stale_callback_and_cross_cabinet_route_are_rejected():
     asyncio.run(run())
 
 
-def test_cabinets_fill_two_slots_each_independently():
+@pytest.mark.parametrize('configured_limit, slots', [(None, 5), (2, 2), (7, 5)])
+def test_cabinets_fill_available_slots_independently(configured_limit, slots):
     class Executor(FakeTokora):
         async def start(self, payload):
             self.started.append(payload)
@@ -158,22 +159,24 @@ def test_cabinets_fill_two_slots_each_independently():
             return result
 
     async def run():
-        app = make_app()
+        settings = {} if configured_limit is None else {'max_active_external': configured_limit}
+        config = Config('fake', '', 99, dispatch_enabled=True, **settings)
+        app = WorkspaceApp(config, ExtendedStore(':memory:'), Transport(), None)
         try:
             await app.handle_chat_update(message(1, 99, '/tokora_workspace Восток'))
             for cabinet in app.cabinets.values():
                 cabinet.worker.tokora = Executor()
-                for user in (7, 8, 9):
+                for user in range(7, 13):
                     cabinet.app.db.grant(user, 10)
                     cabinet.app.db.assign(user, f'account-{user}')
                     cabinet.app.db.queue_task(user, 'Сбор', 'fetch', {
                         'assets': {'accountIds': [f'account-{user}']},
                         'awemeIds': ['7420000000000000000'],
                     })
-            for _ in range(3):
+            for _ in range(6):
                 await asyncio.gather(*(cabinet.worker.tick() for cabinet in app.cabinets.values()))
-            assert [len(cabinet.app.db.running()) for cabinet in app.cabinets.values()] == [2, 2]
-            assert [cabinet.app.db.counts()['queued'] for cabinet in app.cabinets.values()] == [1, 1]
+            assert [len(cabinet.app.db.running()) for cabinet in app.cabinets.values()] == [slots, slots]
+            assert [cabinet.app.db.counts()['queued'] for cabinet in app.cabinets.values()] == [6 - slots] * 2
         finally:
             await app.close()
             app.db.close()

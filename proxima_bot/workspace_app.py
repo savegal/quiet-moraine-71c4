@@ -12,6 +12,7 @@ from secrets import token_hex
 
 from .advanced_db import ExtendedStore
 from .api import ApiError, Telegram, TelegramError, Tokora
+from .config import TOKORA_TASK_SLOTS
 from .db import MAX_USER_ID
 from .extended import ProximaApp
 from .presentation import h, keyboard
@@ -22,7 +23,6 @@ from .workspace_api import CabinetAPI, cabinet_witnesses, has_task_witness, same
 from .workspace_registry import KEY_COMMAND, KEY_FORMAT, PRIMARY_WORKSPACE, WorkspaceRegistry, workspace_database
 
 log = logging.getLogger(__name__)
-TOKORA_TASK_SLOTS = 2
 RICH_BUTTON = re.compile(r'<tg-button(?=\s)[^>]*>')
 RICH_CALLBACK_DATA = re.compile(r'(?<=\s)data="([^"]*)"')
 
@@ -192,7 +192,8 @@ class WorkspaceApp:
         counts = self.cabinets[workspace].app.db.counts()
         awaiting_verification = online > 0 and not self.can_dispatch(workspace)
         caption = ('Запуск ждёт сверки кабинетов. Проверь в Tokora, что ключи относятся к разным кабинетам.'
-                   if awaiting_verification else 'Ключи одного кабинета обслуживают общие два слота Tokora.')
+                   if awaiting_verification
+                   else f'Ключи одного кабинета делят общий лимит Tokora — до {TOKORA_TASK_SLOTS} задач одновременно.')
         rich, plain = screen('▦ ' + workspace_info['name'], [
             ('Код кабинета', workspace), ('Активных ключей', online),
             ('Заказы в очереди / в работе', f'{counts["queued"]} / {counts["running"]}'),

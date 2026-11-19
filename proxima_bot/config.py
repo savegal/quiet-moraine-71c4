@@ -8,6 +8,9 @@ from zoneinfo import ZoneInfo
 from .catalog import MODES
 
 
+TOKORA_TASK_SLOTS = 5
+
+
 def tokora_credentials() -> tuple[str, str]:
     load_dotenv()
     key=os.environ.get('TOKORA_API_KEY','').strip()
@@ -30,7 +33,7 @@ class Config:
     dispatch_enabled: bool = False
     poll_seconds: int = 5
     upstream_timeout: int = 25
-    max_active_external: int = 2
+    max_active_external: int = TOKORA_TASK_SLOTS
     max_tasks_per_day: int = 100
     max_open_tasks: int = 3
     timezone_name: str = 'Asia/Jerusalem'
@@ -45,7 +48,7 @@ class Config:
             raise ValueError('Set TELEGRAM_BOT_TOKEN and OWNER_ID in .env')
         timezone_name = os.getenv('BOT_TIMEZONE', 'Asia/Jerusalem').strip()
         ZoneInfo(timezone_name)
-        max_active = int(os.environ.get('MAX_ACTIVE_TASKS', '2'))
+        max_active = int(os.environ.get('MAX_ACTIVE_TASKS', str(TOKORA_TASK_SLOTS)))
         if max_active < 1:
             raise ValueError('MAX_ACTIVE_TASKS must be at least 1')
         raw_restricted = [item.strip().lower() for item in os.environ.get('RESTRICTED_MODES', '').split(',') if item.strip()]

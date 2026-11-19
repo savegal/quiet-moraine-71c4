@@ -48,7 +48,9 @@ def disclosure(label:str,body:str,*,opened:bool=False)->str:
 
 def home_rich(metrics:dict)->str:
     rich,_=screen('🏠 Главное меню',subtitle='Proxima Soft · заказы и результаты')
-    rich+='<p>Аккаунты · <b>'+number(metrics.get('total_accounts'))+'</b> · доступно <b>'+number(metrics.get('available_accounts'))+'</b></p>'
+    available = metrics.get('available_accounts')
+    availability = '—' if available is None else number(available)
+    rich+='<p>Аккаунты · <b>'+number(metrics.get('total_accounts'))+'</b> · доступно <b>'+availability+'</b></p>'
     rich+='<h3>Сегодня</h3>'
     rich+='<p><b>'+number(metrics.get('comments_today'))+'</b> комментариев · <b>'+number(metrics.get('replies_today'))+'</b> ответов</p>'
     rich+='<footer>На модерации · '+number(metrics.get('moderation_today'))+'</footer>'

@@ -172,12 +172,16 @@ class Worker:
             if prev_snap.get('executionTimeLimit'):
                 result={**result,'executionTimeLimit':True,'executionLimitSeconds':prev_snap.get('executionLimitSeconds') or limit_seconds}
             self.store.transition(job['task_id'],state,snapshot=result,
-                error_code='execution_failed' if state=='failed' else '',expected_state=job['state'])
+                error_code='execution_failed' if state=='failed' else '',expected_state=job['state'],
+                expected_snapshot=job['snapshot_json'])
             self.status_retry_at.pop(task_id, None)
         except ApiError as exc:
             if exc.status==404 or exc.code in ('job_not_found','not_found'):
                 if job['state']!='reconcile':
-                    self.store.transition(job['task_id'],'reconcile',error_code='job_not_found',expected_state=job['state'])
+                    changed = self.store.transition(job['task_id'],'reconcile',error_code='job_not_found',
+                                                    expected_state=job['state'],expected_snapshot=job['snapshot_json'])
+                    if not changed:
+                        return
                 await self.alert('job_not_found',job['task_id'])
             else:
                 delay = max(STATUS_RETRY_SECONDS, exc.retry_after)

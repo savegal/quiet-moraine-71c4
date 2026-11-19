@@ -12,7 +12,7 @@ from typing import Any
 from .accounts import ACCOUNT_STATUS,account_counts,session_state,valid_task_folder
 from .api import ApiError,Telegram,Tokora,TelegramError,lookup_accounts
 from .config import Config
-from .db import Store, TERMINAL_STATES, local_day_start, now, task_target_links_count
+from .db import Store, local_day_start, now, task_target_links_count
 from .presentation import keyboard,home,date_from_unix,report_view,state_label,state_symbol,task_view,h,number,pagination,table_html
 from .updates import UpdateInbox
 from .worker import snapshot_state
@@ -77,7 +77,7 @@ class BotApp:
         self.cfg,self.db,self.tg,self.api=config,db,tg,api
         self.db.owner_id = config.owner_id
         self.db.timezone_name = config.timezone_name
-        self._home_stats_cache: dict[str, tuple[float, dict[str, int]]] = {}
+        self._home_stats_cache: dict[str, tuple[float, dict[str, int | None]]] = {}
 
     def dispatch_active(self)->bool:
         paused = hasattr(self.db,'dispatch_paused') and self.db.dispatch_paused()
@@ -96,7 +96,8 @@ class BotApp:
 
     def format_main_menu(self, metrics: dict[str, Any]) -> str:
         total_acc = number(metrics.get('total_accounts', 0))
-        avail_acc = number(metrics.get('available_accounts', 0))
+        available = metrics.get('available_accounts')
+        avail_acc = '—' if available is None else number(available)
         c_today = number(metrics.get('comments_today', 0))
         r_today = number(metrics.get('replies_today', 0))
         m_today = number(metrics.get('moderation_today', 0))
@@ -120,7 +121,7 @@ class BotApp:
             f'└ Всего опубликовано: {tot_pub}'
         )
 
-    async def get_main_menu_data(self, uid: int | None = None) -> dict[str, int]:
+    async def get_main_menu_data(self, uid: int | None = None) -> dict[str, int | None]:
         is_owner_scope = uid is None or self.owner(uid)
         cache_key = 'owner' if is_owner_scope else f'user:{uid}'
         now_ts = time.monotonic()
@@ -141,8 +142,8 @@ class BotApp:
         if not is_owner_scope and uid is not None:
             user_ids = self.db.account_ids(uid) if hasattr(self.db, 'account_ids') else []
             total_accts = len(user_ids)
-            avail_accts = total_accts
-            if user_ids and hasattr(self, 'assigned_accounts') and hasattr(self.api, 'call'):
+            avail_accts = None if user_ids else 0
+            if user_ids:
                 try:
                     accounts = await asyncio.wait_for(self.assigned_accounts(user_ids), timeout=2.5)
                     if isinstance(accounts, dict):
@@ -278,17 +279,20 @@ class BotApp:
                 tot_pub = max(c_week + r_week, c_day + r_day, c_today + r_today)
 
         total_accts = 0
-        avail_accts = 0
+        avail_accts = None
 
         if isinstance(accts_res, dict):
             counts = accts_res.get('counts')
             if isinstance(counts, dict):
                 total_accts = _safe_int(counts.get('total', accts_res.get('total', 0)))
-                avail_accts = _safe_int(counts.get('active', 0))
+                if type(counts.get('active')) is int:
+                    avail_accts = _safe_int(counts['active'])
             else:
                 total_accts = _safe_int(accts_res.get('total', len(accts_res.get('accounts') or [])))
 
-            if avail_accts == 0 and total_accts > 0:
+            if total_accts == 0:
+                avail_accts = 0
+            elif avail_accts is None:
                 try:
                     if hasattr(self.api, 'account_page'):
                         act_page = await asyncio.wait_for(self.api.account_page(0, 1, status='active'), timeout=2.5)
@@ -299,17 +303,16 @@ class BotApp:
                         )
                     else:
                         act_page = None
-                    if isinstance(act_page, dict):
-                        avail_accts = _safe_int(act_page.get('total', 0))
+                    if isinstance(act_page, dict) and type(act_page.get('total')) is int:
+                        avail_accts = _safe_int(act_page['total'])
                 except Exception:
                     pass
 
-        if total_accts == 0 and uid is not None and hasattr(self.db, 'account_ids'):
+        elif uid is not None and hasattr(self.db, 'account_ids'):
             try:
                 user_ids = self.db.account_ids(uid)
                 if user_ids:
                     total_accts = len(user_ids)
-                    avail_accts = len(user_ids)
             except Exception:
                 pass
 
@@ -536,9 +539,8 @@ class BotApp:
         state=snapshot_state(result,job['state'])
         if not state:return False
         error='execution_failed' if state=='failed' else ''
-        expected_snapshot=job['snapshot_json'] if job['state'] in TERMINAL_STATES else None
         return self.db.transition(job['task_id'],state,snapshot=result,error_code=error,expected_state=job['state'],
-                                  expected_snapshot=expected_snapshot)
+                                  expected_snapshot=job['snapshot_json'])
 
     async def change_task_execution(self,uid:int,job:dict,action:str)->bool:
         required={'pause':'running','resume':'paused'}.get(action)
