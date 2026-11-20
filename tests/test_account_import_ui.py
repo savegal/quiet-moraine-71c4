@@ -16,8 +16,8 @@ def account_rows(*values):
     return '\n'.join(json.dumps([{'name':'sid_guard','value':value}]) for value in values).encode()
 
 
-def document(file_id,size=100):
-    return {'message': {'chat': {'type':'private','id':99}, 'from': {'id':99},
+def document(file_id,size=100,uid=99):
+    return {'message': {'chat': {'type':'private','id':uid}, 'from': {'id':uid},
                         'document': {'file_name':'accounts.txt','file_id':file_id,'file_size':size}}}
 
 
@@ -145,7 +145,7 @@ def test_only_summary_survives_restart(tmp_path):
         assert 'Импорт прерван' in app.tg.out[-1][1]
         assert db.account_import(99,target_id=7)['summary']['assigned']==1
         assert db.account_ids(7)==['confirmed']
-        assert app.account_imports.preview is None
+        assert not app.account_imports.previews
         assert app.api.calls==[]
         db.close()
 
@@ -192,6 +192,163 @@ def test_import_allows_selecting_folder_and_preserves_choice_across_files():
             await app.callback(99,{'data':button_callback(app,'acctimp:apply:')})
             await asyncio.wait_for(app.account_imports.task,timeout=2)
             assert [p.get('folderId') for p in posted]==['1234abcd','1234abcd']
+        finally:
+            await app.account_imports.close()
+            app.db.close()
+
+    asyncio.run(run())
+
+
+def test_member_import_uses_only_reserved_folder_and_cannot_update_other_accounts():
+    async def run():
+        app=new_app()
+        app.tg=TelegramWithEdits()
+        app.db.grant(10,30)
+        app.db.grant(11,30)
+        folder_id='1234abcd'
+        contents={}
+        posted=[]
+        checks={
+            'new':{'exists':False,'accountId':None,'uid':'456','hidden':False},
+            'other':{'exists':True,'accountId':'acc8','uid':'789','hidden':False},
+            'shared':{'exists':True,'accountId':'common','uid':'999','hidden':False},
+            'unknown':{'exists':None,'accountId':None,'uid':None,'hidden':False},
+            'missing-uid':{'exists':False,'accountId':None,'uid':None,'hidden':False},
+            'own':{'exists':True,'accountId':'member-new','uid':'456','hidden':False},
+        }
+
+        async def fetch(file_id,limit):
+            values=('new','other','shared','unknown','missing-uid') if file_id=='first' else ('own',)
+            entries=[{'cookies':[{'name':'sid_guard','value':value}],
+                      'folderId':'bad0f01d','proxyId':'another-proxy'} for value in values]
+            return json.dumps(entries).encode(),'accounts.txt'
+
+        async def read_folder(fid,*,expected_count=None):
+            assert fid==folder_id
+            assert expected_count==(len(contents) or None)
+            return dict(contents)
+
+        async def provider(method,path,**kwargs):
+            if path=='/v1/account-folders':
+                assert method=='GET'
+                return {'available':True,'items':[{'id':folder_id,'name':'Трафер 10','count':len(contents),'active':0}]}
+            payload=kwargs['payload']
+            value=payload['cookies'][0]['value']
+            if path=='/v1/accounts/import/check':
+                assert set(payload)=={'cookies'}
+                return checks[value]
+            assert (method,path)==('POST','/v1/accounts/import')
+            assert set(payload)=={'cookies','folderId'} and payload['folderId']==folder_id
+            assert value in ('new','own')
+            posted.append(value)
+            account={'accountId':'member-new','folderId':folder_id}
+            contents['member-new']=account
+            return {'account':account,'ready':True}
+
+        app.tg.fetch_upload=fetch
+        app.api.call=provider
+        app.api.accounts_in_folder=read_folder
+        try:
+            await app.callback(10,{'data':'accounts'})
+            start=button_callback(app,'acctimp:self')
+            await app.callback(10,{'data':start})
+            assert 'Попроси владельца' in app.tg.out[-1][1]
+            assert app.db.draft(10) is None
+
+            await app.callback(99,{'data':'adm:foldersync:10'})
+            await app.callback(99,{'data':button_callback(app,'adm:fsp:10:')})
+            bind=button_callback(app,'adm:fsbind:10:')
+            await app.callback(10,{'data':bind})
+            assert app.db.member_import_folder(10) is None
+            await app.callback(99,{'data':bind})
+            assert app.db.member_import_folder(10)==folder_id
+            await app.callback(99,{'data':f'adm:fsbind:11:{folder_id}'})
+            assert 'уже привязана к другому траферу' in app.tg.out[-1][1]
+            assert app.db.member_import_folder(11) is None
+
+            await app.callback(10,{'data':start})
+            await app.handle(document('first',uid=10))
+            assert 'Твоя выделенная папка' in app.tg.out[-1][1]
+            assert 'acctimp:folders:' not in str(app.tg.out[-1][2])
+            apply=button_callback(app,'acctimp:apply:')
+            await app.callback(11,{'data':apply})
+            assert posted==[]
+            await app.callback(10,{'data':apply})
+            await asyncio.wait_for(app.account_imports.task,timeout=2)
+            first=app.db.account_import(10,target_id=10)
+            assert first['state']=='finished'
+            assert first['summary']==asdict(ImportSummary(5,attempted=5,assigned=1,conflicts=2,unverified=2))
+            assert app.db.account_ids(10)==['member-new']
+            assert app.db.account_assignee('acc8')==8 and app.db.account_assignee('common') is None
+            assert 'Итог импорта' in app.tg.out[-1][1]
+            result=button_callback(app,'acctimp:result:')
+            await app.callback(11,{'data':result})
+            assert not app.tg.documents
+            await app.callback(10,{'data':result})
+            assert app.tg.documents[-1][1]=='member-new · готов\n'.encode()
+            await app.callback(99,{'data':'acctimp:last:10'})
+            assert button_callback(app,'acctimp:result:')==result
+
+            await app.callback(10,{'data':start})
+            await app.handle(document('next',uid=10))
+            await app.callback(10,{'data':button_callback(app,'acctimp:apply:')})
+            await asyncio.wait_for(app.account_imports.task,timeout=2)
+            assert posted==['new','own']
+            assert app.db.account_import(10,target_id=10)['summary']['assigned']==1
+        finally:
+            await app.account_imports.close()
+            app.db.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('folder_members, revoke_access', [({'acc7'},False),({'acc7','common'},False),({'acc7'},True)])
+def test_member_import_reuses_exact_existing_folder_and_checks_access_before_write(folder_members,revoke_access):
+    async def run():
+        app=new_app()
+        folder_id='1234abcd'
+        calls=[]
+
+        async def fetch(file_id,limit):
+            return account_rows('synthetic'),'accounts.txt'
+
+        async def accounts_for(ids):
+            assert ids==['acc7']
+            return {'acc7':{'folderId':folder_id}}
+
+        async def read_folder(fid,*,expected_count):
+            assert fid==folder_id and expected_count==1
+            return {aid:{'folderId':fid} for aid in folder_members}
+
+        async def provider(method,path,**kwargs):
+            calls.append(path)
+            if path=='/v1/accounts/import/check':
+                if revoke_access:app.db.modify_access(7,99,'revoke',0)
+                return {'exists':False,'accountId':None,'uid':'456','hidden':False}
+            assert kwargs['payload']['folderId']==folder_id
+            return {'account':{'accountId':'member-new'},'ready':True}
+
+        app.tg.fetch_upload=fetch
+        app.api.call=provider
+        app.api.accounts_for=accounts_for
+        app.api.accounts_in_folder=read_folder
+        try:
+            await app.callback(7,{'data':'acctimp:self'})
+            await app.handle(document('existing',uid=7))
+            await app.callback(7,{'data':button_callback(app,'acctimp:apply:')})
+            await asyncio.wait_for(app.account_imports.task,timeout=2)
+            job=app.db.account_import(7,target_id=7)
+            if 'common' in folder_members:
+                assert calls==[]
+                assert app.db.member_import_folder(7) is None
+                assert 'Состав папки отличается' in job['summary']['stopped']
+            elif revoke_access:
+                assert calls==['/v1/accounts/import/check']
+                assert 'Доступ или пул аккаунтов изменился' in job['summary']['stopped']
+            else:
+                assert calls==['/v1/accounts/import/check','/v1/accounts/import']
+                assert app.db.member_import_folder(7)==folder_id
+                assert job['summary']['assigned']==1
         finally:
             await app.account_imports.close()
             app.db.close()

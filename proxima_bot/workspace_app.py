@@ -6,21 +6,25 @@ import logging
 import re
 import time
 from dataclasses import dataclass, replace
+from functools import partial
 from html import unescape
 from itertools import combinations
 from secrets import token_hex
 
 from .advanced_db import ExtendedStore
+from .admission import BotAdmission, ENTRY_OPEN, ENTRY_PANEL, ENTRY_ROUTE
 from .api import ApiError, Telegram, TelegramError, Tokora
 from .config import TOKORA_TASK_SLOTS
 from .db import MAX_USER_ID
 from .extended import ProximaApp
 from .presentation import h, keyboard
+from .provider_alerts import ProviderAlerts
 from .rich_ui import screen
 from .updates import TOKEN_TEXT, UpdateInbox
 from .worker import Worker
 from .workspace_api import CabinetAPI, cabinet_witnesses, has_task_witness, same_cabinet, task_witnesses
-from .workspace_registry import KEY_COMMAND, KEY_FORMAT, PRIMARY_WORKSPACE, WorkspaceRegistry, workspace_database
+from .workspace_registry import (CREATE_COMMAND, KEY_COMMAND, KEY_FORMAT, LEGACY_COMMANDS, MEMBER_COMMAND,
+                                 PRIMARY_WORKSPACE, WorkspaceRegistry, workspace_database)
 
 log = logging.getLogger(__name__)
 RICH_BUTTON = re.compile(r'<tg-button(?=\s)[^>]*>')
@@ -78,16 +82,20 @@ class Cabinet:
 
 class WorkspaceApp:
     credential_command = KEY_COMMAND
+    credential_commands = (KEY_COMMAND, *(alias for alias, command in LEGACY_COMMANDS.items() if command == KEY_COMMAND))
 
     def __init__(self, config, db: ExtendedStore, tg: Telegram, session):
         self.cfg, self.db, self.tg, self.session = config, db, tg, session
         self.registry = WorkspaceRegistry(db.conn, config.database_path, config.upstream_key)
+        self.admission = BotAdmission(db,tg,config.owner_id)
+        self.provider_alerts = ProviderAlerts(tg,config.owner_id)
         self.cabinets: dict[str, Cabinet] = {}
         self.services: asyncio.TaskGroup | None = None
         self.key_confirmation: tuple[tuple[str, str, str, str], float] | None = None
         self.key_input: tuple[str, float] | None = None
         for workspace in self.registry.workspaces():
             self.open_cabinet(workspace)
+        self.admission.migrate_members(cabinet.app.db for cabinet in self.cabinets.values())
 
     def open_cabinet(self, workspace: dict) -> Cabinet:
         workspace_id = workspace['id']
@@ -98,20 +106,24 @@ class WorkspaceApp:
             self.cfg.max_active_external, TOKORA_TASK_SLOTS))
         store = self.db if workspace_id == PRIMARY_WORKSPACE else ExtendedStore(path, timezone_name=config.timezone_name)
         tg = CabinetTelegram(self.session, config.telegram_token, self.tg, self.registry, workspace_id)
-        api = CabinetAPI(self.session, config.base_url, config.upstream_timeout)
+        api = CabinetAPI(self.session,config.base_url,config.upstream_timeout,
+                         report_error=partial(self.provider_alerts.request,workspace['name']))
         try:
             api.set_keys(self.registry.credentials(workspace_id))
         except ValueError as exc:
             # Keep access to the owner panel if the key file needs to be restored.
             log.error('Cannot load Tokora credentials for cabinet %s: %s', workspace_id, exc)
         app = ProximaApp(config, store, tg, api)
+        app.bot_admission = self.admission
         app.cabinet_name = workspace['name']
+        app.cabinet_dispatch_allowed = lambda: self.can_dispatch(workspace_id)
         app.can_switch_cabinet = lambda uid: workspace_id != PRIMARY_WORKSPACE or any(
             row['id'] != PRIMARY_WORKSPACE and self.registry.can_open(row['id'], uid, config.owner_id)
             for row in self.registry.workspaces()
         )
         cabinet = Cabinet(app, api, Worker(store, api, tg, config,
-                                          dispatch_allowed=lambda: self.can_dispatch(workspace_id)))
+                          dispatch_allowed=app.cabinet_dispatch_allowed,
+                          report_task_error=partial(self.provider_alerts.task,workspace['name'])))
         self.cabinets[workspace_id] = cabinet
         if self.services is not None:
             self.start_cabinet(cabinet)
@@ -153,6 +165,7 @@ class WorkspaceApp:
                     self.start_cabinet(cabinet)
                 services.create_task(UpdateInbox(self).run())
                 services.create_task(self.run_cabinet_verification())
+                services.create_task(self.provider_alerts.run())
         finally:
             self.services = None
 
@@ -191,16 +204,16 @@ class WorkspaceApp:
         online = len(self.cabinets[workspace].api.clients)
         counts = self.cabinets[workspace].app.db.counts()
         awaiting_verification = online > 0 and not self.can_dispatch(workspace)
-        caption = ('Запуск ждёт сверки кабинетов. Проверь в Tokora, что ключи относятся к разным кабинетам.'
+        caption = ('Запуск ждёт сверки кабинетов. Проверь, что ключи относятся к разным кабинетам.'
                    if awaiting_verification
-                   else f'Ключи одного кабинета делят общий лимит Tokora — до {TOKORA_TASK_SLOTS} задач одновременно.')
+                   else f'Лимит кабинета · до {self.cabinets[workspace].app.cfg.max_active_external} задач одновременно.')
         rich, plain = screen('▦ ' + workspace_info['name'], [
             ('Код кабинета', workspace), ('Активных ключей', online),
             ('Заказы в очереди / в работе', f'{counts["queued"]} / {counts["running"]}'),
         ], caption=caption)
         rows = []
         for key in keys:
-            label = 'Ключ из .env' if key['id'] == 'env' else 'Ключ ' + key['id']
+            label = 'Основной ключ' if key['id'] == 'env' else 'Ключ ' + key['id']
             prefix = '✓' if key['enabled'] else '○'
             rows.append([(f'{prefix} {label}', f'ws:key:{workspace}:{key["id"]}', None)])
         rows.extend([
@@ -220,7 +233,7 @@ class WorkspaceApp:
         if key_id != 'env':
             rows.append([('× Удалить из бота', f'ws:confirm:{workspace}:{key_id}:delete', 'danger')])
         rows.append([('↶ К кабинету', f'ws:view:{workspace}', None)])
-        title = 'Ключ из .env' if key_id == 'env' else 'Ключ ' + key_id
+        title = 'Основной ключ' if key_id == 'env' else 'Ключ ' + key_id
         await self.tg.rich(uid, *screen(title, subtitle='Включён' if key['enabled'] else 'Выключен'), keyboard(*rows))
 
     def known_cabinet_witnesses(self, workspace: str) -> set[str]:
@@ -261,7 +274,7 @@ class WorkspaceApp:
                         matches = True
                         break
             if not matches:
-                raise ValueError('Не удалось подтвердить общий кабинет. Проверь папку аккаунтов или задачу в Tokora.')
+                raise ValueError('Не удалось подтвердить общий кабинет. Проверь папку аккаунтов или задачу в кабинете.')
         distinct = []
         for item in cabinets:
             current = item['id']
@@ -283,7 +296,7 @@ class WorkspaceApp:
                 raise ValueError(f'Ключ относится к кабинету «{item["name"]}». Добавь его туда.')
             if match is None:
                 raise ValueError(f'Не удалось отличить этот кабинет от «{item["name"]}». '
-                                 'Проверь доступ обоих ключей и создай папку в одном из кабинетов Tokora.')
+                                 'Проверь доступ обоих ключей и создай папку в одном из кабинетов.')
             distinct.append(current)
         self.registry.store_key(workspace, token, observed.markers, distinct_from=tuple(distinct),
                                 new_identity=not existing)
@@ -292,17 +305,13 @@ class WorkspaceApp:
         await self.cabinet_screen(uid, workspace)
 
     async def callback(self, uid: int, query: dict) -> None:
-        if query.get('id'):
-            try:
-                await self.tg.answer_callback(query['id'])
-            except TelegramError:
-                pass
+        await self.acknowledge(query)
         _, action, *parts = query.get('data', '').split(':')
         is_owner = uid == self.cfg.owner_id
         if action == 'menu' and not parts:
             return await self.menu(uid)
         if action == 'new' and is_owner and not parts:
-            return await self.tg.send(uid, 'Отправь <code>/tokora_workspace Название</code>.')
+            return await self.tg.send(uid, f'Отправь <code>{CREATE_COMMAND} Название</code>.')
         if not parts or not self.registry.can_open(parts[0], uid, self.cfg.owner_id):
             return
         workspace = parts[0]
@@ -323,10 +332,10 @@ class WorkspaceApp:
         if action == 'addkey' and len(parts) == 1:
             self.key_input = (workspace, time.monotonic() + 600)
             name = self.registry.workspace(workspace)['name']
-            return await self.tg.send(uid, f'Вставь ключ <code>tk_…</code> для кабинета «{h(name)}» одним сообщением. '
+            return await self.tg.send(uid, f'Вставь ключ доступа для кабинета «{h(name)}» одним сообщением. '
                                       'Нужны права чтения задач и аккаунтов.')
         if action == 'member' and len(parts) == 1:
-            return await self.tg.send(uid, f'Отправь <code>/tokora_member {workspace} ID</code>, '
+            return await self.tg.send(uid, f'Отправь <code>{MEMBER_COMMAND} {workspace} ID</code>, '
                                       'затем выдай подписку и назначь аккаунты в админке этого кабинета.')
         if action == 'key' and len(parts) == 2:
             self.key_confirmation = None
@@ -364,7 +373,7 @@ class WorkspaceApp:
             except TelegramError:
                 await self.tg.send(uid, 'Telegram не удалил сообщение с ключом. Удали его из чата вручную.')
         try:
-            if command == '/tokora_workspace':
+            if command == CREATE_COMMAND:
                 workspace = self.registry.create_workspace(args)
                 self.open_cabinet(self.registry.workspace(workspace))
                 self.db.log(uid, 'tokora_workspace_added', workspace)
@@ -392,23 +401,50 @@ class WorkspaceApp:
         except ValueError as exc:
             await self.tg.send(uid, h(exc))
         except ApiError as exc:
-            message = 'Tokora не подтвердила ключ. Проверь его права и подключение.'
+            self.provider_alerts.request('Подключение кабинета','Проверка ключа','',exc)
+            message = 'Не удалось подтвердить ключ. Проверь его права и подключение.'
             if exc.status == 429:
-                message = 'Tokora ограничила частоту запросов. Добавь ключ чуть позже.'
+                message = 'Превышена частота запросов. Добавь ключ чуть позже.'
             await self.tg.send(uid, message)
+
+    async def acknowledge(self, query: dict) -> None:
+        if query_id := query.get('id'):
+            try:
+                await self.tg.answer_callback(query_id)
+            except TelegramError:
+                pass
+
+    async def entry_callback(self, actor: int, profile: dict, query: dict, data: str) -> None:
+        await self.acknowledge(query)
+        if (data==ENTRY_OPEN and self.admission.can_enter(actor)) or (data==ENTRY_PANEL and actor==self.cfg.owner_id):
+            selected = self.registry.selected(actor,self.cfg.owner_id)
+            app = self.cabinets[selected].app
+            if data==ENTRY_PANEL:
+                return await app.admin_dashboard(actor)
+            app.db.touch_user(actor,profile.get('first_name',''),profile.get('last_name',''),profile.get('username',''))
+            return await app.command(actor,'/start')
+        await self.admission.callback(actor,data,profile)
 
     async def handle_chat_update(self, update: dict) -> None:
         query = update.get('callback_query')
         message = (query.get('message') if query else update.get('message')) or {}
-        actor = ((query or message).get('from') or {}).get('id')
+        profile = (query or message).get('from') or {}
+        actor = profile.get('id')
         chat = message.get('chat') or {}
-        if type(actor) is not int or chat.get('type') != 'private' or chat.get('id') != actor:
+        if type(actor) is not int or not 0<actor<=MAX_USER_ID or chat.get('type') != 'private' or chat.get('id') != actor:
             return
+        data = str(query.get('data','')) if query else ''
+        if query and data.startswith(ENTRY_ROUTE):
+            return await self.entry_callback(actor,profile,query,data)
+        if not self.admission.can_enter(actor):
+            if query:await self.acknowledge(query)
+            return await self.admission.status(actor)
         if not query:
             text = message.get('text') or ''
             words = text.split(maxsplit=1)
             if words:
                 command = words[0].split('@', 1)[0].lower()
+                command = LEGACY_COMMANDS.get(command, command)
                 if command == KEY_COMMAND:
                     return await self.command(actor, message, command, words[1].strip() if len(words) == 2 else '')
                 if actor == self.cfg.owner_id and (tokens := set(TOKEN_TEXT.findall(text))):
@@ -417,12 +453,11 @@ class WorkspaceApp:
                     if pending and time.monotonic() <= pending[1] and len(tokens) == 1:
                         args = f'{pending[0]} {next(iter(tokens))}'
                     return await self.command(actor, message, KEY_COMMAND, args)
-                if command in ('/workspaces', '/tokora_workspace', '/tokora_member'):
+                if command in ('/workspaces', CREATE_COMMAND, MEMBER_COMMAND):
                     return await self.command(actor, message, command, words[1].strip() if len(words) == 2 else '')
         selected = self.registry.selected(actor, self.cfg.owner_id)
         unknown_origin = PRIMARY_WORKSPACE if len(self.cabinets) == 1 else None
         if query:
-            data = str(query.get('data', ''))
             if data.startswith('ws:'):
                 return await self.callback(actor, query)
             if data.startswith('wc:'):
@@ -430,6 +465,8 @@ class WorkspaceApp:
                 origin, data = route if route else (None, '')
             else:
                 origin = self.registry.message_workspace(actor, message.get('message_id', 0)) or unknown_origin
+            if data.startswith(ENTRY_ROUTE):
+                return await self.entry_callback(actor,profile,query,data)
             if origin != selected:
                 try:
                     await self.tg.answer_callback(query['id'], 'Открой экран в текущем пуле через /workspaces.')

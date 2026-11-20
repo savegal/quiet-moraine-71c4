@@ -2,13 +2,20 @@ from __future__ import annotations
 from html import escape
 from datetime import datetime
 import json
+import re
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from .db import PUBLICATION_TIMER_KINDS, snapshot_preparing, snapshot_publication_started, task_execution_limit_seconds
+from .db import PUBLICATION_TIMER_KINDS, TERMINAL_STATES, now, snapshot_preparing, snapshot_publication_started, task_execution_limit_seconds
 from .api import task_finish_pending
 
 BUTTON_SYMBOLS = frozenset('▣◇◈▤▥▧⌂⌕⚙◷✓×↻＋←→↶↪↗⇩↑♡▷▶Ⅱ■✎−·○!')
+ENGINE_REFERENCE = re.compile(
+    r"""(?:https?://)?(?:[\w-]+\.)*tokora\.online(?:[/?#][^\s<>"'\\]*)?"""
+    r"""|(?:https?://)?(?:t\.me|telegram\.me)/tokora[\w-]*(?:[/?#][^\s<>"'\\]*)?"""
+    r'|(?:tg://resolve\?domain=|@|/)?tokora[\w-]*|токор[\w-]+',
+    re.IGNORECASE,
+)
 
 STATE_DISPLAY = {
     'queued': ('◷', 'В очереди'),
@@ -53,6 +60,11 @@ def h(value:Any) -> str:
     return escape(str(value if value is not None else ''),quote=True)
 
 
+def public_system_text(text:str)->str:
+    """Remove integration names and links from system-generated output."""
+    return ENGINE_REFERENCE.sub('Proxima',text)
+
+
 def button_text(label:str)->str:
     label=' '.join(label.split())
     if label and (label[0] in BUTTON_SYMBOLS or label.isdecimal()):
@@ -79,6 +91,10 @@ def keyboard(*rows:list[tuple[str,str,str|None]],pack:Callable[[str],str]|None=N
 def date_from_unix(unix:int,zone:str='Asia/Jerusalem')->str:
     if not unix:return '—'
     return datetime.fromtimestamp(unix,ZoneInfo(zone)).strftime('%d.%m.%Y %H:%M %Z')
+
+
+def rich_time(unix:int,fallback:str)->str:
+    return f'<tg-time unix="{int(unix)}" format="dt">{h(fallback)}</tg-time>'
 
 
 def state_label(state:str)->str:
@@ -163,19 +179,22 @@ def table_html(title:str,items:list[tuple[str,Any]],caption:str='')->tuple[str,s
 
 
 ERROR_LABELS={
-    'external_pool_unknown':'В кабинете идёт другой заказ. Сервер не показал, какие аккаунты он использует. Бот дождётся освобождения кабинета.',
-    'invalid_target':'Исполнитель отклонил цели заказа. Проверь выбранные видео или комментарии и подтверди заказ снова.',
+    'job_busy':'Сервис занят. Заказ остаётся в очереди, повторим запуск автоматически.',
+    'rate_limited':'Достигнут лимит запросов. Повторим попытку после паузы.',
+    'external_pool_unknown':'Заказ ждёт повторной проверки очереди.',
+    'local_pool_unknown':'Бот уточняет пул незавершённого заказа другого пользователя.',
+    'invalid_target':'Не удалось принять цели заказа. Проверь выбранные видео или комментарии и подтверди заказ снова.',
     'invalid_source':'Исходный сбор недоступен или ещё не завершён.',
     'missing_source':'Для выбранных комментариев нужен исходный сбор.',
     'empty_job':'В заказе нет комментариев для ответов.',
-    'invalid_reply_links':'Исполнитель не смог разобрать список ссылок. Проверь его и повтори заказ.',
+    'invalid_reply_links':'Не удалось разобрать список ссылок. Проверь его и повтори заказ.',
     'too_many_reply_links':'В одном заказе по ссылкам допускается до 300 непустых строк.',
     'invalid_order_targets':'Не удалось проверить ссылки заказа. Укажи корректную ссылку на видео или комментарий для выбранного действия.',
     'short_link_retry':'Короткая ссылка пока не открывается. Бот повторит проверку.',
     'short_link_unresolved':'Не удалось открыть короткую ссылку TikTok. Попробуй указать полную ссылку.',
     'account_assignment_changed':'Назначенные аккаунты изменились',
-    'account_folder_mismatch':'Заказ ждёт настройки папки. На сервере должна быть отдельная папка со всеми аккаунтами этого заказа, без посторонних аккаунтов. Бот проверит папку снова.',
-    'account_check_unavailable':'Не удалось проверить аккаунты и папку на сервере. Бот повторит проверку.',
+    'account_folder_mismatch':'Заказ ждёт настройки папки. В кабинете нужна отдельная папка со всеми аккаунтами заказа. Бот проверит папку снова.',
+    'account_check_unavailable':'Не удалось проверить аккаунты и папку. Бот повторит проверку.',
     'no_active_accounts':'В пуле заказа нет аккаунтов с активной сессией.',
     'not_enough_active_accounts':'После проверки доступно меньше аккаунтов, чем указано в настройках заказа.',
     'admin_action_required':'Требуется действие администратора',
@@ -291,7 +310,7 @@ def task_has_replies(task:dict)->bool:
 
 def report_view(task:dict,report:dict)->tuple[str,str]:
     """Rich HTML with native Telegram table; safe fallback is ordinary HTML."""
-    title=h(task['display_name']); idtag=h(task['task_id'])
+    title=h(task['display_name']); idtag=h(public_system_text(task['task_id']))
     comm=report.get('comments') or {}; replies=report.get('replies') or {}
     l=report.get('likes') or {}; web=report.get('web') or {}
     status=f'{state_symbol(task["state"])} {state_label(task["state"])}'
@@ -368,7 +387,7 @@ def report_view(task:dict,report:dict)->tuple[str,str]:
     return rich,plain
 
 
-def task_metrics(t:dict)->list[tuple[str,str]]:
+def task_metrics(t:dict,*,queue_paused:bool=False)->list[tuple[str,str]]:
     snapshot=json.loads(t['snapshot_json'] or '{}')
     preflight=json.loads(t.get('preflight_json') or '{}')
     names={'publish':'Комментарии и ответы','keyword_reply':'Ответы по ключевым фразам',
@@ -385,9 +404,10 @@ def task_metrics(t:dict)->list[tuple[str,str]]:
         stage = {'short_link_retry':'Ожидание повторной проверки ссылки',
                  'account_folder_mismatch':'Ожидание настройки папки аккаунтов',
                  'account_check_unavailable':'Ожидание проверки папки аккаунтов'}.get(t.get('error_code'))
-        if not stage:
-            stage = 'Ожидание выбранного времени' if t.get('fire_at') else 'Ожидание свободной очереди кабинета'
-        rows.append(('Этап', stage))
+        if not stage and not queue_paused:
+            stage = 'Ожидание выбранного времени' if (t.get('fire_at') or 0)>now() else 'Ожидание свободной очереди кабинета'
+        if stage:
+            rows.insert(0,('Этап',stage))
     phase=preflight.get('phase')
     if phase=='checking':
         rows.append(('Аккаунты','Проверка состава папки и сессий'))
@@ -404,10 +424,6 @@ def task_metrics(t:dict)->list[tuple[str,str]]:
         return rows
     if t['state']=='stopping' and task_finish_pending(snapshot):
         rows.append(('Этап','Ожидается подтверждение завершения'))
-    elif snapshot.get('state') == 'interrupted':
-        rows.append(('Итог','Выполнение прервано'))
-    elif snapshot.get('state') == 'completed_with_errors':
-        rows.append(('Итог','Завершено с ошибками'))
     if t.get('settle_poll_at'):
         rows.append(('Этап','Поздняя проверка публикаций'))
     elif t['state'] in ('running','paused'):
@@ -532,18 +548,42 @@ def empty_video_search(t:dict, *, entry_total:int|None=None)->bool:
     return bool(known) and max(known) == 0
 
 
-def task_view(t:dict)->str:
-    body=(f'<b>▣ {h(t["display_name"])}</b> · <code>{h(t["task_id"])}</code>\n'
-          f'<b>{state_symbol(t["state"])} {state_label(t["state"])}</b>\n')
+def task_status(t:dict)->str:
+    state=t['state']
+    if state=='queued':return '◷ Заказ поставлен в очередь'
+    if state in TERMINAL_STATES:
+        upstream_state=str(json.loads(t.get('snapshot_json') or '{}').get('state') or '').strip().lower()
+        if state=='failed' and upstream_state=='interrupted':return '! Выполнение прервано'
+        if state=='completed' and upstream_state=='completed_with_errors':return '! Завершено с ошибками'
+    return f'{state_symbol(state)} {state_label(state)}'
+
+
+def task_notices(t:dict,queue_paused:bool)->list[str]:
+    notices=[]
+    if t.get('state')=='queued' and queue_paused:
+        notices.append('Запуск приостановлен.')
+    if snapshot_timeout(t):
+        limit_sec=count(json.loads(t.get('snapshot_json') or '{}').get('executionLimitSeconds')) or task_execution_limit_seconds(t)
+        limit=minutes_label(max(1,limit_sec//60))
+        notices.append(f'Достигнут лимит выполнения ({limit}).')
+    if t.get('error_code'):
+        notices.append(ERROR_LABELS.get(t['error_code'],'Состояние требует проверки.'))
+    if empty_video_search(t):
+        notices.append('Ничего не нашлось. Измени тему поиска и создай новый сбор.')
+    return notices
+
+
+def task_view(t:dict,*,timezone_name:str='Asia/Jerusalem',queue_paused:bool=False)->str:
+    body=f'<b>▣ {h(t["display_name"])}</b>\n<b>{h(task_status(t))}</b>\n'
+    for notice in task_notices(t,queue_paused):
+        body+='\n'+h(notice)+'\n'
+    if fire_at:=t.get('fire_at'):
+        body+='\n<b>Запланировано</b> · '+h(date_from_unix(fire_at,timezone_name))+'\n'
     if banner:=task_execution_phase_banner(t):body+='\n<b>'+h(banner)+'</b>\n'
-    if empty_video_search(t):body+='\nНичего не нашлось. Измени тему поиска и создай новый сбор.\n'
-    if t.get('state')=='queued':body+='\nЗаказ поставлен в очередь. Он начнётся, когда освободится исполнитель.\n'
-    rows=task_metrics(t)
+    rows=task_metrics(t,queue_paused=queue_paused)
     for index,(label,value) in enumerate(rows):
         branch='└' if index==len(rows)-1 else '├'
         body+=f'\n{branch} {h(label)}: <code>{h(value)}</code>'
-    if t.get('error_code'):
-        body+='\n\n'+h(ERROR_LABELS.get(t['error_code'],'Состояние требует проверки.'))
     publications=publication_card_rows(t)
     if publications:
         body+='\n\n<b>Публикации</b>'
@@ -554,16 +594,19 @@ def task_view(t:dict)->str:
         body+='\n\n'+h(COMMENT_CHECK_NOTE)
     if task_has_replies(t):
         body+='\n\n'+h(REPLY_CHECK_NOTE)
-    return body
+    return body+'\n\nЗаказ · <code>'+h(public_system_text(t['task_id']))+'</code>'
 
 
-def task_rich(t:dict,details:tuple[tuple[str,Any],...]=())->str:
+def task_rich(t:dict,details:tuple[tuple[str,Any],...]=(),*,timezone_name:str='Asia/Jerusalem',queue_paused:bool=False)->str:
     head=(f'<h2>▣ {h(t["display_name"])}</h2>'
-          f'<p><b>{state_symbol(t["state"])} {state_label(t["state"])}</b></p>')
+          f'<p><b>{h(task_status(t))}</b></p>')
+    notices=task_notices(t,queue_paused)
+    if notices:
+        head+='<blockquote>'+'<br>'.join(h(notice) for notice in notices)+'</blockquote>'
+    if fire_at:=t.get('fire_at'):
+        head+='<p><b>Запланировано</b> · '+rich_time(fire_at,date_from_unix(fire_at,timezone_name))+'</p>'
     if banner:=task_execution_phase_banner(t):head+='<p><b>'+h(banner)+'</b></p>'
-    if empty_video_search(t):head+='<p>Ничего не нашлось. Измени тему поиска и создай новый сбор.</p>'
-    if t.get('state')=='queued':head+='<p>Заказ поставлен в очередь. Он начнётся, когда освободится исполнитель.</p>'
-    rows=[*task_metrics(t),*details]
+    rows=[*task_metrics(t,queue_paused=queue_paused),*details]
     publications=publication_card_rows(t)
     if publications:
         head+='<h3>Публикации</h3>'+rich_table(('Тип','Подтверждено','Цель на видео'),publications)
@@ -573,13 +616,7 @@ def task_rich(t:dict,details:tuple[tuple[str,Any],...]=())->str:
         head+='<footer>Счётчик обработанных действий включает попытки отправки.</footer>'
     if task_has_comments(t):
         head+='<p>'+h(COMMENT_CHECK_NOTE)+'</p>'
-    if t.get('error_code'):
-        head+='<footer>'+h(ERROR_LABELS.get(t['error_code'],'Состояние требует проверки.'))+'</footer>'
-    if snapshot_timeout(t):
-        limit_sec=json.loads(t.get('snapshot_json') or '{}').get('executionLimitSeconds') or task_execution_limit_seconds(t)
-        limit_min=max(1,int(limit_sec)//60)
-        head+=f'<footer>Заказ остановлен по лимиту выполнения ({minutes_label(limit_min)}).</footer>'
     if task_has_replies(t):
         head+='<details><summary>Как считаются ответы</summary><p>'+h(REPLY_CHECK_NOTE)+'</p></details>'
-    head+='<footer>Заказ · <code>'+h(t['task_id'])+'</code></footer>'
+    head+='<footer>Заказ · <code>'+h(public_system_text(t['task_id']))+'</code></footer>'
     return head

@@ -1,7 +1,7 @@
 """Native Bot API 10.3+ layout primitives; no browser HTML or custom CSS."""
 from __future__ import annotations
 
-from .presentation import h, number, rich_table
+from .presentation import date_from_unix, h, number, rich_table, rich_time
 
 
 STAGES=('Материалы','Объём','Проверка')
@@ -13,7 +13,7 @@ def stage_html(stage:int)->str:
                                  for i,label in enumerate(STAGES,1)))+'</footer>'
 
 
-def screen(title:str,items=(),*,subtitle:str='',stage:int|None=None,caption:str='')->tuple[str,str]:
+def screen(title:str,items=(),*,subtitle:str='',stage:int|None=None,lead:tuple[str,str]=('',''),caption:str='')->tuple[str,str]:
     rich='<h2>'+h(title)+'</h2>'
     plain='<b>'+h(title)+'</b>'
     if stage:
@@ -22,6 +22,8 @@ def screen(title:str,items=(),*,subtitle:str='',stage:int|None=None,caption:str=
     if subtitle:
         rich+='<p>'+h(subtitle)+'</p>'
         plain+='\n'+h(subtitle)
+    rich+=lead[0]
+    plain+=lead[1]
     for label,value in items:
         rich+='<p>'+h(label)+' · <b>'+h(value)+'</b></p>'
         plain+='\n'+h(label)+' · <b>'+h(value)+'</b>'
@@ -29,6 +31,21 @@ def screen(title:str,items=(),*,subtitle:str='',stage:int|None=None,caption:str=
         rich+='<footer>'+h(caption)+'</footer>'
         plain+='\n\n'+h(caption)
     return rich,plain
+
+
+def order_launch(fire_at:int|None,timezone_name:str,*,paused:bool)->tuple[str,str]:
+    if fire_at:
+        date=date_from_unix(fire_at,timezone_name)
+        rich='<p><b>Запуск</b> · не раньше '+rich_time(fire_at,date)+'</p>'
+        plain='\n<b>Запуск</b> · не раньше '+h(date)
+    else:
+        rich='<p><b>Запуск</b> · по очереди кабинета</p>'
+        plain='\n<b>Запуск</b> · по очереди кабинета'
+    if paused:
+        notice='Запуск очереди приостановлен. Заказ будет ждать её возобновления.'
+        rich='<blockquote>'+h(notice)+'</blockquote>'+rich
+        plain='\n<b>'+h(notice)+'</b>'+plain
+    return rich,plain+'\n'
 
 
 def button_row(*buttons:tuple[str,str,str|None])->str:

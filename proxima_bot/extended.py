@@ -38,20 +38,21 @@ from .export_parts import EXPORT_PART_BYTES, ExportParts
 from .live_cards import LiveCards, POLL_SECONDS, workspace_task_updates_live
 from .operations import declared_operations, load_spec, operation_channel, operation_plan, valid_body
 from .presentation import (MODE_SYMBOLS, error_breakdown, h, keyboard, minutes_label, number, pagination, report_view,
-                           result_status, state_label, state_symbol, task_view, task_rich, table_html, rich_table,
-                           REPLY_CHECK_NOTE, task_has_replies, empty_video_search)
+                           result_status, state_label, state_symbol, task_view, task_rich, table_html, rich_table, rich_time,
+                           REPLY_CHECK_NOTE, task_has_replies, empty_video_search, public_system_text)
 from .worker import snapshot_state
 from .proxy_console import ProxyConsoleMixin
-from .order_templates import (LocalTemplatesMixin, MEDIA_TEMPLATE_MODES, TEMPLATE_LABELS, task_order_mode,
+from .order_templates import (LocalTemplatesMixin, MEDIA_TEMPLATE_MODES, TEMPLATE_LABELS, COMMENT_TEMPLATE_MODES,
+    template_matches, template_order_values, template_texts, task_order_mode,
                               template_input_steps, template_values, template_mode)
 from .order_form import (order_fields, field_value, field_text, parse_field, set_field,
                          complete_order_form, form_rows, edit_order_form, VOLUME_KEYS, field_presets, parse_volume_message,
                          publication_blocks, reply_quantity, volume_example)
 from .media_order_form import MediaOrderFormMixin
-from .rich_ui import screen, button_row, disclosure, home_rich
+from .rich_ui import screen, button_row, disclosure, home_rich, order_launch
+from .updates import TOKEN_TEXT
 
 SAFE_ID=re.compile(r'^[a-zA-Z0-9_-]{1,128}$')
-SERVICE_NAME=re.compile(r'tokora(?:\.online)?|токор[аыуое]',re.IGNORECASE)
 # The live entries endpoint accepts 1–100 even though OpenAPI declares 200.
 EXPORT_ENTRIES_PAGE_SIZE=100
 NATIVE_LINK_EXPORT_KINDS={'publish','keyword_reply','feedwarm'}
@@ -106,7 +107,7 @@ ORDER_LIMIT_LABELS={
 }
 FETCH_OPTION_KEYS={'fetch_count':{'fetchCount','collectAll'},'fetch_replies':{'includeReplies'}}
 REVIEW_EDIT_STEPS={'edit_options':'options','edit_when':'when','edit_search':'warm_json',
-                   'edit_name':'name','edit_comments':'comments','edit_replies':'replies',
+                   'edit_name':'name',
                    'edit_likes':'likes','edit_keywords':'keywords'}
 
 
@@ -281,14 +282,25 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         return frozenset(modes)
 
     def set_mode_restricted(self, mode: str, restricted: bool) -> None:
-        if mode not in MODES or mode in OWNER_ONLY:
+        if (mode not in MODES and mode not in MEDIA_TEMPLATE_MODES) or mode in OWNER_ONLY:
             raise ValueError('Доступ к этому виду заказа изменить нельзя.')
         self.db.set_order_mode_access(self.cfg.owner_id, mode, restricted)
 
     def mode_restricted(self,uid:int,mode:str)->bool:
         if mode == 'source_reply':
             mode = 'reply_links'
-        return not self.owner(uid) and (mode in MEDIA_TEMPLATE_MODES or mode in self.restricted_modes())
+        if mode in MEDIA_TEMPLATE_MODES:
+            return not self.owner(uid) or self.db.order_mode_access().get(mode,False)
+        return not self.owner(uid) and mode in self.restricted_modes()
+
+    def media_orders_visible(self,uid:int)->bool:
+        return any(not self.mode_restricted(uid,mode) for mode in MEDIA_TEMPLATE_MODES)
+
+    def media_order_buttons(self,uid:int)->list[tuple]:
+        return [button for mode,button in (
+            ('video_post',('↑ Загрузить видео','upload:video','success')),
+            ('photo_post',('＋ Фотоальбом','owner_edit:album',None)),
+        ) if not self.mode_restricted(uid,mode)]
 
     def allow_photos(self,uid:int)->bool:
         return self.owner(uid) or (hasattr(self.db,'can_use_photos') and self.db.can_use_photos(uid))
@@ -300,8 +312,8 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         text=self.format_main_menu(metrics)
         quick=[btn for btn in (
             ('⌕ Собрать комментарии','new:fetch',None),('♡ Лайки комментариев','new:commentlike',None),
-            ('▷ Сбор видео','new:feedwarm',None),('▷ Публикации · Видео / фото','posts',None),
-        ) if (is_owner if btn[1]=='posts' else not self.mode_restricted(uid,btn[1][4:]))]
+            ('▷ Сбор видео','new:feedwarm',None),('▷ Публикации','posts',None),
+        ) if (self.media_orders_visible(uid) if btn[1]=='posts' else not self.mode_restricted(uid,btn[1][4:]))]
         pool_switch = getattr(self, 'can_switch_cabinet', None)
         pool_row = [[('▦ Рабочие пулы', 'ws:menu', None)]] if pool_switch and pool_switch(uid) else []
         buttons=keyboard(
@@ -329,24 +341,28 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
                                   keyboard([('↶ Обзор','home',None)]))
         draft=self.db.draft(uid)
         can_resume=bool(draft and (draft['mode'] in MODES or draft['mode'] in ('task_copy','source_reply','media_order')))
+        if draft and draft['mode']=='media_order' and self.mode_restricted(uid,str(draft['data'].get('kind'))+'_post'):
+            can_resume=False
         rows=[]
         if can_resume:
             rows.append([('↪ Продолжить черновик','wiz_continue','primary')])
         rows.extend([(f'{MODE_SYMBOLS[mode]} {spec[0]}','new:'+mode,'primary' if mode=='publish' and not can_resume else None)]
                     for mode,spec in MODES.items() if not self.mode_restricted(uid,mode))
-        if self.owner(uid):
-            rows.append([('▷ Видео','upload:video',None),('▧ Фотоальбом','owner_edit:album',None)])
+        media=self.media_order_buttons(uid)
+        if media:rows.append(media)
         rows.append([('▧ Мои шаблоны','templates',None)])
         rows.append([('↶ Обзор','home',None)])
-        rich,plain=screen('＋ Новый заказ',subtitle='Что нужно сделать?',stage=1)
+        rich,plain=screen('＋ Новый заказ',subtitle='Выбери вид заказа')
+        if can_resume:
+            rich+=button_row(*rows[0])
         def visible_row(items):
             return tuple(item for item in items if not self.mode_restricted(uid,item[1].split(':',1)[1]))
         pub_rows=[r for r in (
             visible_row([('Комментарии и ответы','new:publish','primary' if not can_resume else None)]),
-            visible_row([('По ссылкам','new:reply_links',None),('По ключевым словам','new:keyword_reply',None)]),
+            visible_row([('Ответы по ссылкам','new:reply_links',None),('Ответы по фразам','new:keyword_reply',None)]),
         ) if r]
         if pub_rows:
-            rich+='<h3>Комментарии и ответы</h3>'+''.join(button_row(*r) for r in pub_rows)
+            rich+='<h3>Публикации</h3>'+''.join(button_row(*r) for r in pub_rows)
         collect_rows=[r for r in (
             visible_row([('Комментарии','new:fetch',None),('Видео','new:feedwarm',None)]),
             visible_row([('Лайки комментариев','new:commentlike',None),('Юзернеймы','new:usernames',None)]),
@@ -354,12 +370,10 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if collect_rows:
             rich+='<h3>Сбор и реакции</h3>'+''.join(button_row(*r) for r in collect_rows)
         if self.owner(uid):
-            rich+=disclosure('Публикации и обслуживание',button_row(('Загрузить видео','upload:video',None),('Фотоальбом','owner_edit:album',None))+
+            rich+=disclosure('Публикации и обслуживание',(button_row(*media) if media else '')+
                              button_row(('Проверка аккаунтов','new:check',None)))
-        rich+='<footer>Добавь материалы, выбери объём и проверь заказ перед отправкой в очередь.</footer>'
-        plain+='\n\nВыбери вид заказа. Затем добавь материалы, укажи объём и проверь результат.'
         full=keyboard(*rows)
-        compact=keyboard(*([rows[0]] if can_resume else []),[('▧ Мои шаблоны','templates',None),('↶ Обзор','home',None)])
+        compact=keyboard([('▧ Мои шаблоны','templates',None),('↶ Обзор','home',None)])
         if isinstance(self.tg,Telegram):
             await self.tg.rich(uid,rich,plain,compact,fallback_keyboard=full)
         else:await self.tg.rich(uid,rich,plain,full)
@@ -368,6 +382,10 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if mode not in MODES or self.mode_restricted(uid,mode):return
         if mode=='check':return await self.owner_show(uid,'accounts_check')
         if not self.db.is_active(uid,self.cfg.owner_id) or not self.has_order_pool(uid):return await self.create(uid)
+        if mode in COMMENT_TEMPLATE_MODES:
+            title=MODES[mode][0]+' · '+datetime.now(self.schedule_zone).strftime('%d.%m %H:%M')
+            self.save_wizard_step(uid,mode,'choose_template',{'name':title,'auto_name':True})
+            return await self.order_template_picker(uid)
         if auto_name:
             title=MODES[mode][0]+' · '+datetime.now(self.schedule_zone).strftime('%d.%m %H:%M')
             step=self.wizard_steps(mode)[1]
@@ -380,12 +398,27 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         result=[]
         for record in self.db.templates(uid):
             item=self.db.template(uid,record['template_id'])
-            if item and (template_mode(item)==mode or (mode in ('reply_links','source_reply') and template_values(item).get('replies'))):result.append(item)
+            if template_matches(item,mode):result.append(item)
         return result
+
+    def approved_order_template(self,uid:int,mode:str,data:dict)->dict|None:
+        reference=data.get('approved_template')
+        if not isinstance(reference,list) or len(reference)!=2:return None
+        item=self.db.template(uid,reference[0])
+        if not template_matches(item,mode) or item['approved_revision']!=reference[1]:return None
+        expected=template_order_values(item,mode)
+        return item if (template_texts(data)==template_texts(expected)
+                        and set(data.get('disabled_fields') or ())==set(expected['disabled_fields'])) else None
+
+    async def choose_order_template(self,uid:int,mode:str,data:dict)->None:
+        clean={key:data[key] for key in ('name','auto_name','videos','reply_links','keywords','fire_at') if key in data}
+        self.save_wizard_step(uid,mode,'choose_template',clean)
+        await self.order_template_picker(uid)
 
     async def order_template_picker(self,uid:int,page:int=0)->None:
         draft=self.db.draft(uid)
         if not draft or draft['mode'] not in MODES:return
+        if self.mode_restricted(uid,draft['mode']):return
         items=self.matching_order_templates(uid,draft['mode'])
         page=max(0,min(page,(len(items)-1)//10))
         token=self.wizard_token(draft)
@@ -394,19 +427,26 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         nav=[]
         if page:nav.append(('← Ранее',f'wiz:tplpage_{page-1}:{token}',None))
         if (page+1)*10<len(items):nav.append(('→ Далее',f'wiz:tplpage_{page+1}:{token}',None))
-        rows.extend([nav,[('↶ К заказу',f'wiz:template_back:{token}',None)]])
+        required=draft['mode'] in COMMENT_TEMPLATE_MODES
+        if required:
+            back=('↶ К заказу',f'wiz:template_back:{token}',None) if draft['step']!='choose_template' else ('↶ К видам заказов','create',None)
+            rows.extend([nav,[('＋ Создать шаблон','tpl_new',None),('▧ Мои шаблоны','templates',None)],
+                         [back]])
+        else:
+            rows.extend([nav,[('↶ К заказу',f'wiz:template_back:{token}',None)]])
         hint=('Выбери шаблон. Уже введённые ссылки сохранятся. Объём подтвердишь отдельно.' if items
-              else 'Подходящих шаблонов пока нет. Можно продолжить ввод вручную.')
+              else 'Нужен подходящий шаблон, одобренный владельцем.' if required else 'Подходящих шаблонов пока нет. Можно продолжить ввод вручную.')
         rich,plain=screen('▧ Шаблон для заказа',subtitle=MODES[draft['mode']][0],caption=hint)
         await self.tg.rich(uid,rich,plain,keyboard(*rows))
 
     async def apply_order_template(self,uid:int,tid:str,draft:dict)->None:
         item=self.db.template(uid,tid)
-        if not item or (template_mode(item)!=draft['mode'] and not (draft['mode'] in ('reply_links','source_reply') and template_values(item).get('replies'))):
+        if self.mode_restricted(uid,draft['mode']):return
+        if not template_matches(item,draft['mode']):
             return await self.say(uid,'Шаблон недоступен для этого вида заказа.',keyboard(
                 [('↶ К заказу','wiz:template_back:'+self.wizard_token(draft),None)]))
         current=draft['data']
-        values=template_values(item)
+        values=template_order_values(item,draft['mode'])
         asked=set(values.get('ask_fields') or [])
         for field in MODES[draft['mode']][1:]:
             if field=='options':continue
@@ -418,7 +458,8 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
                     else:
                         values[field]=current[field]
                     asked.discard(field)
-        values['options']={**(values.get('options') or {}),**(current.get('options') or {})}
+        if draft['mode'] not in COMMENT_TEMPLATE_MODES:
+            values['options']={**(values.get('options') or {}),**(current.get('options') or {})}
         for field in ('name','auto_name','fire_at'):
             if field in current:values[field]=current[field]
         values['ask_fields']=list(asked)
@@ -519,7 +560,8 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
 
     @staticmethod
     def wizard_steps(mode:str)->tuple[str,...]:
-        return ('name',*MODES[mode][1:],'when','review')
+        fields=(field for field in MODES[mode][1:] if field not in ('comments','replies'))
+        return ('name',*fields,'when','review')
 
     def save_wizard_step(self,uid:int,mode:str,step:str,data:dict)->None:
         self.db.save_draft(uid,mode,step,{**data,'wizard_token':token_hex(6)})
@@ -532,16 +574,8 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         return data['wizard_token']
 
     @staticmethod
-    def wizard_optional(mode:str,step:str,data:dict)->bool:
-        if step in ('options','when','fetch_count','fetch_replies','fetch_keywords'):
-            return True
-        if mode!='publish':
-            return False
-        comments,replies=publication_blocks(mode,data)
-        if step=='comments':
-            if 'replies' in data.get('disabled_fields',[]):return False
-            return not data.get('review_edit') or (replies and reply_quantity(data)>0)
-        return step=='replies' and comments
+    def wizard_optional(step:str)->bool:
+        return step in ('options','when','fetch_count','fetch_replies','fetch_keywords')
 
     async def wizard_field(self,uid:int,mode:str,step:str,*,error:str='')->None:
         draft=self.db.draft(uid)
@@ -558,20 +592,20 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if step=='name':buttons.append([('✓ Название автоматически','wiz:auto_name:'+token,'primary')])
         if step=='fetch_count':
             selected=data.get('fetch_count',100)
-            buttons.append([(str(count),f'wiz:fetch_{count}:{token}','primary' if count==selected else None)
+            buttons.append([(f'✓ {count}' if count==selected else str(count),f'wiz:fetch_{count}:{token}','primary' if count==selected else None)
                             for count in (100,1000)])
         if step=='fetch_replies':
             with_replies=data.get('fetch_replies',False)
-            buttons.append([('Без ответов','wiz:fetch_without_replies:'+token,None if with_replies else 'primary'),
-                            ('С ответами','wiz:fetch_with_replies:'+token,'primary' if with_replies else None)])
+            buttons.append([('Без ответов' if with_replies else '✓ Без ответов','wiz:fetch_without_replies:'+token,None if with_replies else 'primary'),
+                            ('✓ С ответами' if with_replies else 'С ответами','wiz:fetch_with_replies:'+token,'primary' if with_replies else None)])
         if step=='likes':
             selected=data.get('likes',15)
-            buttons.append([(str(n),'wiz:likes_'+str(n)+':'+token,'primary' if n==selected else None) for n in (5,10,15,20)])
+            buttons.append([(f'✓ {n}' if n==selected else str(n),f'wiz:likes_{n}:{token}','primary' if n==selected else None) for n in (5,10,15,20)])
         key='fire_at' if step=='when' else step
         keep=data.get(key)
         if step not in ('fetch_count','fetch_replies') and keep and (step!='when' or keep>time.time()+60):
             buttons.append([('✓ Оставить введённое','wiz:keep:'+token,'primary')])
-        if self.wizard_optional(mode,step,data) and step not in ('fetch_count','fetch_replies'):
+        if self.wizard_optional(step) and step not in ('fetch_count','fetch_replies'):
             label={'options':'→ Без доп. настроек','when':'✓ По очереди',
                    'fetch_count':'✓ Лимит 100','fetch_replies':'Только комментарии'}.get(step,'→ Пропустить')
             buttons.append([(label,'wiz:skip:'+token,'success' if step=='when' else None)])
@@ -608,16 +642,18 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         route=lambda verb:f'{prefix}:{verb}:{token}'
         title='↪ Ответы на собранное' if mode=='source_reply' else MODE_SYMBOLS[mode]+' '+MODES[mode][0]
         if field:
+            current=field_value(field,data)
             text='<b>'+h(title)+'</b>\n<b>Объём и действия</b>\n\n'
             text+='<b>'+h(field.label)+'</b>\n'+h(field.hint)+f'\nДопустимо · <b>{field.minimum}–{field.maximum}</b>'
-            text+='\n\nСейчас · <b>'+h(field_text(field,field_value(field,data)))+'</b>'
-            buttons=[(str(n),route('value_'+str(n)),None) for n in field_presets(field)]
+            text+='\n\nСейчас · <b>'+h(field_text(field,current))+'</b>'
+            buttons=[(str(n),route('value_'+str(n)),'primary' if n==current else None)
+                     for n in field_presets(field)]
             rows=[buttons[i:i+4] for i in range(0,len(buttons),4)]
             rows.append([('↶ К объёму заказа',route('form_back'),None)])
             if error:text+='\n\n<b>Проверь ввод</b>\n'+h(error)
             rich,_=screen(title,subtitle='Своё значение',stage=None if prefix=='lt' else 2)
             rich+='<h3>'+h(field.label)+'</h3><p>Введи целое число · <b>'+str(field.minimum)+'–'+str(field.maximum)+'</b>.</p>'
-            rich+='<p>Сейчас · <b>'+h(field_text(field,field_value(field,data)))+'</b></p>'
+            rich+='<p>Сейчас · <b>'+h(field_text(field,current))+'</b></p>'
             if field.hint:rich+='<footer>'+h(field.hint)+'</footer>'
             if error:rich+='<blockquote><b>Проверь ввод</b><br>'+h(error)+'</blockquote>'
             return await self.tg.rich(uid,rich,text,keyboard(*rows))
@@ -631,14 +667,15 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         def controls(items,*,short:bool=False):
             html=''
             for item in items:
-                value=field_text(item,field_value(item,data))
+                current=field_value(item,data)
+                value=field_text(item,current)
                 label=({'commentsPerVideo':'На каждое видео','repliesPerComment':'На каждый комментарий',
                         'likesPerComment':'Лайков каждому','likesPerReply':'Лайков каждому'}.get(item.key,item.label) if short else item.label)
                 html+='<p>'+h(label)+' · <b>'+h(value)+'</b></p>'
                 choices=[]
                 if not item.boolean:
                     for n in field_presets(item):
-                        choices.append((str(n),route('pick_'+item.key+'_'+str(n)),'primary' if field_value(item,data)==n else None))
+                        choices.append((f'✓ {n}' if n==current else str(n),route(f'pick_{item.key}_{n}'),'primary' if n==current else None))
                 choices.append(('Переключить' if item.boolean else 'Своё',route('form_'+item.key),'link'))
                 html+=button_row(*choices)
             return html
@@ -692,7 +729,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         buttons=[('✎ '+item.label+' · '+field_text(item,field_value(item,data)),route('form_'+item.key),None) for item in visible]
         # Basic Telegram fallback keeps the same editing actions in compact rows.
         fallback_rows=[buttons[i:i+2] for i in range(0,len(buttons),2)]
-        rows.append([('✓ '+('Сохранить параметры' if prefix=='lt' else 'Подтвердить объём · к проверке'),route({'wiz':'quick','source':'skip','lt':'keep'}[prefix]),'primary')])
+        rows.append([('✓ '+('Сохранить параметры' if prefix=='lt' else 'Проверить заказ'),route({'wiz':'quick','source':'skip','lt':'keep'}[prefix]),'primary')])
         if prefix=='wiz':rows.append([('◷ Запланировать',route('skip'),None)])
         if secondary:rows.append([('⚙ Параметры',route('form_more'),None)])
 
@@ -721,6 +758,10 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         draft=self.db.draft(uid)
         if not draft or draft['mode'] not in MODES:return await self.create(uid)
         if draft['mode']=='check':return await self.begin(uid,'check')
+        if draft['step']=='choose_template':return await self.order_template_picker(uid)
+        if draft['mode'] in COMMENT_TEMPLATE_MODES and (draft['step'] in ('comments','replies') or
+                not self.approved_order_template(uid,draft['mode'],draft['data'])):
+            return await self.choose_order_template(uid,draft['mode'],draft['data'])
         if draft['step']=='review':return await self.preview(uid)
         await self.wizard_field(uid,draft['mode'],draft['step'])
 
@@ -754,6 +795,10 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             return await self.order_template_picker(uid,int(verb[8:]))
         if verb.startswith('tpl_'):
             return await self.apply_order_template(uid,verb[4:],draft)
+        if step=='choose_template':return await self.order_template_picker(uid)
+        if mode in COMMENT_TEMPLATE_MODES and (step in ('comments','replies') or verb in ('edit_comments','edit_replies')
+                or not self.approved_order_template(uid,mode,data)):
+            return await self.choose_order_template(uid,mode,data)
         if step=='options' and await self.order_form_action(uid,mode,data,verb):return
         if verb=='auto_name' and step=='name':
             title=MODES[mode][0]+' · '+datetime.now(self.schedule_zone).strftime('%d.%m %H:%M')
@@ -782,6 +827,8 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             steps=self.wizard_steps(mode)
             index=steps.index(step)
             if not index or (index==1 and data.get('auto_name')):return await self.create(uid)
+            if mode in COMMENT_TEMPLATE_MODES:
+                data.pop('template_steps',None)
             self.save_wizard_step(uid,mode,steps[index-1],data)
             return await self.show_wizard(uid)
         if verb=='skip':return await self.wizard_skip(uid)
@@ -835,6 +882,9 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if not d:return
         if d['mode'] not in MODES:
             return await self.aux_input(uid,d,text)
+        if d['mode'] in COMMENT_TEMPLATE_MODES and (d['step'] in ('choose_template','comments','replies') or
+                not self.approved_order_template(uid,d['mode'],d['data'])):
+            return await self.show_wizard(uid)
         mode,step,data=d['mode'],d['step'],d['data']
         if step=='review':return await self.preview(uid)
         try:
@@ -855,17 +905,6 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             elif step=='like_links':
                 data[step]=validate_like_links(limited_lines(text,300,700))
             elif step=='keywords':data[step]=limited_lines(text,100,100)
-            elif step in ('comments','replies'):
-                if mode=='publish' and data.get('form_ready') and not data.get(step):
-                    volume_key,likes_key={
-                        'comments':('commentsPerVideo','likesPerComment'),
-                        'replies':('repliesPerComment','likesPerReply'),
-                    }[step]
-                    options=data.get('options') or {}
-                    if options.get(volume_key)==0:
-                        data['options']={key:value for key,value in options.items() if key not in (volume_key,likes_key)}
-                data[step]=limited_lines(text,100,700)
-                data['disabled_fields']=[field for field in data.get('disabled_fields',[]) if field!=step]
             elif step=='likes':
                 x=int(text.strip())
                 if not 1<=x<=100:raise ValueError('Укажи 1–100 лайков')
@@ -901,23 +940,24 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         d=self.db.draft(uid)
         if not d or d['mode'] not in MODES:return
         mode,step,data=d['mode'],d['step'],d['data']
-        if not self.wizard_optional(mode,step,data):return
+        if mode in COMMENT_TEMPLATE_MODES and (step in ('choose_template','comments','replies') or
+                not self.approved_order_template(uid,mode,data)):
+            return await self.show_wizard(uid)
+        if not self.wizard_optional(step):return
         if step=='fetch_count':data['fetch_count']=100
         elif step=='fetch_replies':data['fetch_replies']=False
         elif step=='fetch_keywords':data[step]=[]
         elif step=='when':data.pop('fire_at',None)
-        else:
-            if step!='options':data[step]=[] if step in ('comments','replies') else {}
         await self.next_step(uid,mode,step,data)
 
     async def preview(self,uid:int)->None:
         d=self.db.draft(uid)
         if not d or d['mode'] not in MODES or d['step']!='review':return
         mode,data=d['mode'],d['data']
-        if mode=='publish' and not any(publication_blocks(mode,data)):
-            step='replies' if 'comments' in data.get('disabled_fields',[]) else 'comments'
-            self.save_wizard_step(uid,mode,step,{**data,'review_edit':True})
-            return await self.wizard_field(uid,mode,step,error='Добавь тексты комментариев или ответов.')
+        template=None
+        if mode in COMMENT_TEMPLATE_MODES:
+            template=self.approved_order_template(uid,mode,data)
+            if not template:return await self.choose_order_template(uid,mode,data)
         data=complete_order_form(mode,data)
         comments,replies=publication_blocks(mode,data)
         if replies and not comments and not reply_quantity(data):
@@ -941,7 +981,8 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if pool is None:return
         ids,pool_label = pool
         token=self.wizard_token(d)
-        entries=[('Название',data['name']),('Тип',MODES[mode][0]),(pool_label,len(ids))]
+        entries=[('Вид заказа',MODES[mode][0]),(pool_label,len(ids))]
+        if template:entries.insert(0,('Одобренный шаблон',template['name']))
         material_fields=['videos','like_links','reply_links','keywords']
         if comments:material_fields.append('comments')
         if replies and reply_quantity(data)>0:material_fields.append('replies')
@@ -956,11 +997,6 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         entries.extend(order_settings_rows(mode,settings) if mode=='fetch' else form_rows(mode,data))
         if mode == 'usernames':
             entries.append(('Где искать','Комментарии и ответы'))
-        entries=[row for row in entries if row[0] not in ('Задержка между действиями, сек.','ИИ-уникализация','Аккаунтов на видео','Лимит ответов на видео')]
-        if data.get('fire_at'):entries.append(('Запуск',datetime.fromtimestamp(data['fire_at'],self.schedule_zone).strftime('%d.%m.%Y %H:%M %Z')))
-        else:entries.append(('Запуск','Когда освободится очередь кабинета'))
-        if not self.dispatch_active():entries.append(('Отправка','Приостановлена администратором'))
-        # Secondary settings are disclosed below the main summary.
         photo_buttons=[]
         if self.allow_photos(uid) and (choices:=photo_choices(mode,data)):
             current=data.get('photo_mode','off')
@@ -991,11 +1027,12 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             except ApiError:entries.append(('Прогноз трафика','не удалось получить'))
         secondary_labels={field.label for field in order_fields(mode,data) if field.key not in VOLUME_KEYS}
         secondary=[item for item in entries if item[0] in secondary_labels]
-        entries=[item for item in entries if item[0] not in secondary_labels and item[0] not in ('Тексты комментариев','Тексты ответов','Ключи','Тип','Название')]
+        entries=[item for item in entries if item[0] not in secondary_labels and item[0] not in ('Тексты комментариев','Тексты ответов','Ключи')]
         limit_min=task_execution_limit_seconds({'awemeIds':data.get('videos') or [],'replyLinks':data.get('reply_links') or [],'likeLinks':data.get('like_links') or []})//60
         limit_start='с начала публикаций' if MODE_KIND[mode] in ('publish','keyword_reply') else 'с начала выполнения'
-        rich,plain=screen('▤ Проверка заказа',entries,subtitle=data['name'],stage=3,
-                          caption=f'После подтверждения заказ встанет в очередь. Лимит выполнения — {minutes_label(limit_min)} {limit_start}. Ожидание в очереди и подготовка аккаунтов не учитываются.')
+        launch=order_launch(data.get('fire_at'),self.cfg.timezone_name,paused=not self.dispatch_active())
+        rich,plain=screen('▤ Проверка заказа',entries,subtitle=data['name'],stage=3,lead=launch,
+                          caption=f'Лимит выполнения — {minutes_label(limit_min)} {limit_start}. Ожидание в очереди и подготовка аккаунтов не учитываются.')
         if mode=='publish' and data.get('videos'):
             count=len(data['videos'])
             plan=[]
@@ -1026,8 +1063,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             [('✎ Объём заказа','wiz:edit_options:'+token,None),('◷ Время запуска','wiz:edit_when:'+token,None)],
             [('✎ Видео / ссылки','wiz:edit_targets:'+token,None)] if mode!='feedwarm' else [],
             [('✎ Название','wiz:edit_name:'+token,None)],
-            [('✎ Тексты комментариев','wiz:edit_comments:'+token,None)] if mode=='publish' else [],
-            [('✎ Тексты ответов','wiz:edit_replies:'+token,None)] if mode in ('publish','reply_links','keyword_reply') else [],
+            [('▧ Выбрать другой шаблон','wiz:templates:'+token,None)] if template else [],
             [('✎ Лайков на комментарий','wiz:edit_likes:'+token,None)] if mode=='commentlike' else [],
             [('✎ Ключевые фразы','wiz:edit_keywords:'+token,None)] if mode=='keyword_reply' else [],
             [('⚙ Изменить параметры сбора','wiz:fetch_edit:'+token,None)] if mode=='fetch' else [],
@@ -1036,10 +1072,10 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             [('▧ Сохранить шаблон','wiz:template:'+token,None)],
             [('↶ Назад','wiz:back:'+token,None),('× Отменить','wiz:cancel:'+token,'danger')])
         if isinstance(self.tg,Telegram):
-            rich+='<details><summary>Изменить материалы · сохранить шаблон</summary>'
+            extra=''
             for row in markup['inline_keyboard'][2:-1]:
-                rich+='<tg-button-row>'+''.join('<tg-button type="callback_data" style="link" data="'+h(button['callback_data'])+'">'+h(button['text'])+'</tg-button>' for button in row)+'</tg-button-row>'
-            rich+='</details>'
+                extra+=button_row(*((button['text'],button['callback_data'],'link') for button in row))
+            rich+=disclosure('Изменить материалы или сохранить шаблон',extra)
             compact={'inline_keyboard':[markup['inline_keyboard'][0],markup['inline_keyboard'][1],markup['inline_keyboard'][-1]]}
             await self.tg.rich(uid,rich,plain,compact,fallback_keyboard=markup)
         else:
@@ -1047,12 +1083,16 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
 
     async def _submit_extended(self,uid:int)->None:
         d=self.db.draft(uid)
+        if d and d['mode'] in COMMENT_TEMPLATE_MODES and d['step']=='choose_template':
+            return await self.order_template_picker(uid)
         if not d or d['mode'] not in MODES or d['step']!='review':return await self.say(uid,'Черновик отсутствует.')
         if not self.db.is_active(uid,self.cfg.owner_id):return await self.access(uid)
         mode,data=d['mode'],d['data']
         if self.mode_restricted(uid,mode):
             return await self.say(uid,'Этот вид заказа доступен только владельцу.')
         if mode=='check':return await self.begin(uid,'check')
+        if mode in COMMENT_TEMPLATE_MODES and not self.approved_order_template(uid,mode,data):
+            return await self.choose_order_template(uid,mode,data)
         data=complete_order_form(mode,data)
         if not self.allow_photos(uid):data={**data,'photo_mode':'off'}
         try:
@@ -1065,7 +1105,9 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
                 payload['accountFolder']=folder
             task_id=self.db.queue_task(uid,data['name'],MODE_KIND[mode],payload,
                     max_daily=self.cfg.max_tasks_per_day,max_open=self.cfg.max_open_tasks,
-                    fire_at=int(data.get('fire_at') or 0),draft_token=self.wizard_token(d))
+                    fire_at=int(data.get('fire_at') or 0),draft_token=self.wizard_token(d),
+                    template_allowed=(lambda:bool(self.approved_order_template(uid,mode,data)))
+                                     if mode in COMMENT_TEMPLATE_MODES else None)
             self.db.log(uid,'task_created',task_id)
             await self.task(uid,task_id)
         except (ApiError,ValueError) as exc:
@@ -1093,8 +1135,8 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             name = self.workspace_task_name(item)[:70]
             state = snapshot_state(item,'unknown') or 'unknown'
             status = 'Завершено с ошибками' if state=='completed' and item.get('state')=='completed_with_errors' else state_label(state)
-            lines.append(f'{state_symbol(state)} <b>{h(name)}</b>\n└ {h(status)} · <code>{h(tid)}</code>')
-            buttons.append([(f'{state_symbol(state)} {name[:45]}','tokora_task:'+tid,None)])
+            lines.append(f'{state_symbol(state)} <b>{h(name)}</b>\n└ {h(status)} · <code>{h(public_system_text(tid))}</code>')
+            buttons.append([(f'{state_symbol(state)} {name[:45]}','cabinet_task:'+tid,None)])
         nav = pagination('tasks_page:',page,result['more'])
         plain=heading+'\n\n'+('\n\n'.join(lines) or 'На этой странице задач нет.')
         rich,_=screen('▣ Все задачи',subtitle='Страница '+str(page+1))
@@ -1111,7 +1153,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if local:
             return local['display_name']
         name=re.sub(r'^\[PX-[0-9a-f]{32}\]\s*','',str(result.get('name') or ''),count=1)
-        return name or str(result.get('id') or 'Заказ')
+        return public_system_text(name or str(result.get('id') or 'Заказ'))
 
     async def read_workspace_task(self,tid:str)->dict:
         observed_at = now()
@@ -1127,7 +1169,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
 
     def render_workspace_task(self,card:dict)->tuple[str,str,dict]:
         tid = card['task_id']
-        report = [('▥ Отчёт','tokora_report:'+tid,'primary')] if card['kind'] in PUBLICATION_REPORT_KINDS else []
+        report = [('▥ Отчёт','cabinet_report:'+tid,'primary')] if card['kind'] in PUBLICATION_REPORT_KINDS else []
         rich = task_rich(card,(('Раздел','Все задачи'),))
         plain = task_view(card)+'\n\nРаздел · все задачи'
         controls=[]
@@ -1140,7 +1182,8 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             rich += '<footer>'+caption+'</footer>'
             plain += '\n\n'+caption
         return rich,plain,self.owner_keyboard(
-            controls,[('↻ Обновить','tokora_task:'+tid,None)],report,
+            controls,[('↻ Обновить','cabinet_task:'+tid,None)],report,
+            self.collected_reply_button(self.cfg.owner_id,card),
             [('▤ Результаты','entries:'+tid,None),('⇩ Экспорт','exports:'+tid,None)],
             [('◇ Аккаунты задания','task_accounts:'+tid+':0',None)] if card['kind']!='import' else [],
             [('▥ Итоги сбора','collected:'+tid,None)] if card['kind']=='fetch' else [],
@@ -1164,7 +1207,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         else:
             tid=value
         if not SAFE_ID.fullmatch(tid):return
-        back=self.owner_keyboard([('↶ К заказу','tokora_task:'+tid,None)])
+        back=self.owner_keyboard([('↶ К заказу','cabinet_task:'+tid,None)])
         try:
             card=await self.read_workspace_task(tid)
             state=card['state']
@@ -1173,7 +1216,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
                 self.db.save_draft(uid,'workspace_control','confirm',{'token':token,'task_id':tid})
                 return await self.say(uid,'Остановить заказ <b>'+h(card['display_name'])+'</b>?',
                                       self.owner_keyboard([('■ Да, остановить','wt:stop:'+token,'danger')],
-                                                          [('↶ К заказу','tokora_task:'+tid,None)]))
+                                                          [('↶ К заказу','cabinet_task:'+tid,None)]))
             allowed={'stop':('running','paused'),'pause':('running',),'resume':('paused',),
                      'verify':('running','paused','completed','stopped')}
             if verb=='verify' and card['kind']!='publish':return
@@ -1195,7 +1238,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if not self.owner(uid) or not SAFE_ID.fullmatch(tid):
             return
         back = [('↶ Все задачи','tasks',None)]
-        card_button = [('↶ Карточка задачи','tokora_task:'+tid,None)]
+        card_button = [('↶ Карточка задачи','cabinet_task:'+tid,None)]
         try:
             card = await self.read_workspace_task(tid)
             if report and card['kind'] in PUBLICATION_REPORT_KINDS:
@@ -1211,7 +1254,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
 
     async def workspace_task_accounts(self,uid:int,tid:str,page:int)->None:
         if not self.owner(uid) or not SAFE_ID.fullmatch(tid):return
-        back=[('↶ К заказу','tokora_task:'+tid,None)]
+        back=[('↶ К заказу','cabinet_task:'+tid,None)]
         try:
             card=await self.read_workspace_task(tid)
             if card['kind']=='import':
@@ -1264,9 +1307,13 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             rows.append([('✓ Проверить статусы','verify:'+task_id,None)])
         if state in ('running','paused') and started:
             control=('Ⅱ Пауза','pause:'+task_id,None) if state=='running' else ('▷ Продолжить','resume:'+task_id,'success')
-            rows.append(([control] if self.owner(t['user_id']) else [])+[('■ Остановить','stopconfirm:'+task_id,'danger')])
-        if state=='completed' and kind=='fetch' and not self.mode_restricted(t['user_id'],'source_reply'):
-            rows.append([('↪ Ответить на собранное','source_reply:'+task_id,'success')])
+            control_row=([control] if self.owner(t['user_id']) else [])+[('■ Остановить','stopconfirm:'+task_id,'danger')]
+            if state=='paused' and self.owner(t['user_id']):
+                rows.insert(0,control_row)
+            else:
+                rows.append(control_row)
+        reply_button=self.collected_reply_button(t['user_id'],t)
+        if reply_button:rows.insert(0,reply_button)
         if started and kind=='fetch':
             rows.append([('▥ Итоги сбора','collected:'+task_id,None)])
         if kind in ('publish','keyword_reply','fetch','usernames','feedwarm','commentlike'):
@@ -1293,18 +1340,10 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if state in ('completed','stopped','failed','canceled'):
             rows.append([('Скрыть из списка','hide_task:'+task_id,None)])
         rows.append([('↶ Мои задачи','tasks',None),('↻ Обновить','refresh:'+task_id,None)])
-        txt=task_view(t)
-        details=()
-        if t.get('fire_at'):
-            date=datetime.fromtimestamp(t['fire_at'],self.schedule_zone).strftime('%d.%m.%Y %H:%M %Z')
-            txt+='\n└ Запланировано: <code>'+h(date)+'</code>'
-            details=(('Запланировано',date),)
-        rich=task_rich(t,details)
-        if state=='queued' and not self.dispatch_active():
-            caption='Запуск очереди отключён администратором.'
-            txt+='\n\n'+caption
-            rich+='<footer>'+caption+'</footer>'
-        elif task_updates_live(t):
+        card_options={'timezone_name':self.cfg.timezone_name,'queue_paused':state=='queued' and not self.dispatch_active()}
+        txt=task_view(t,**card_options)
+        rich=task_rich(t,**card_options)
+        if task_updates_live(t) and not card_options['queue_paused']:
             txt+='\n\n↻ Карточка обновляется автоматически.'
             rich+='<footer>↻ Карточка обновляется автоматически.</footer>'
         return rich,txt,keyboard(*rows)
@@ -1329,14 +1368,20 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
 
     async def templates(self,uid:int,page:int=0)->None:
         records=self.db.templates(uid)
+        own_count=sum(item.get('owned',True) for item in records)
+        records=[item for item in records if item['mode'] not in MEDIA_TEMPLATE_MODES or not self.mode_restricted(uid,item['mode'])]
         size=10
         page=max(0,min(page,(len(records)-1)//size))
         rows=[[('＋ Создать шаблон','tpl_new','success')]]
-        own_count=sum(item.get('owned',True) for item in records)
         rich,txt=screen('▧ Мои шаблоны',subtitle='Готовые тексты для следующего заказа',caption=f'Своих шаблонов {own_count} из 50 · Страница {page+1}')
         for item in records[page*size:(page+1)*size]:
             label=TEMPLATE_LABELS.get(item['mode'],'Заказ')
             suffix=' · для команды' if item.get('is_shared') and item.get('owned',True) else (' · командный' if not item.get('owned',True) else '')
+            if item.get('owned',True):
+                proposal=self.db.template_review(uid,item['template_id'])
+                if proposal:
+                    suffix+=' · '+('на одобрении' if proposal['state']=='pending' else 'правки отклонены')
+                    if not item['approved_revision']:item['name']=proposal['name']
             rows.append([('▧ '+item['name'][:45]+suffix,'tpl:'+item['template_id'],None)])
             rich+=button_row((item['name'][:60],'tpl:'+item['template_id'],'link'))+'<footer>'+h(label+suffix)+'</footer>'
             txt+='\n\n<b>'+h(item['name'])+'</b>\n'+h(label+suffix)
@@ -1372,6 +1417,8 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if not self.db.is_active(uid,self.cfg.owner_id):return await self.access(uid)
         item=self.db.template(uid,tid)
         if not item:return await self.say(uid,'Шаблон не найден.')
+        if not item['approved_revision']:
+            return await self.say(uid,'Для заказа нужен одобренный шаблон.',keyboard([('↶ Шаблон','tpl:'+tid,None)]))
         data=json.loads(item['payload'])
         if item['mode'] in MEDIA_TEMPLATE_MODES:
             return await self.media_template_drafts(uid,tid)
@@ -1387,6 +1434,10 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if mode not in MODES:
             return await self.say(uid,'Этот вид заказа недоступен.')
         if not self.has_order_pool(uid):return await self.create(uid)
+        if mode in COMMENT_TEMPLATE_MODES:
+            if not template_matches(item,mode):return await self.say(uid,'В шаблоне нет подходящих одобренных текстов.')
+            self.save_wizard_step(uid,mode,'choose_template',{'name':item['name'][:60],'auto_name':True})
+            return await self.apply_order_template(uid,tid,self.db.draft(uid))
         if 'draft' in data:
             draft=template_values(item)
             for key in ('fire_at','review_account_ids','review_account_folder','wizard_token','review_edit','template_steps'):
@@ -1401,7 +1452,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if 'job' in data:
             return await self.prepare_copy(uid,data['job'],item['name'])
 
-    async def prepare_copy(self,uid:int,job:dict,name:str):
+    async def prepare_copy(self,uid:int,job:dict,name:str,*,replace_targets:bool=False):
         if not self.db.is_active(uid,self.cfg.owner_id):return await self.access(uid)
         if job.get('sourceJob') or job.get('likeSourceJob'):
             return await self.say(uid,'Запусти повтор из карточки исходной задачи.')
@@ -1410,6 +1461,14 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             return await self.say(uid,'Этот вид заказа доступен только владельцу.')
         if mode not in MODES:return await self.say(uid,'Этот вид заказа нельзя скопировать.')
         if not self.has_order_pool(uid):return await self.create(uid)
+        if mode in COMMENT_TEMPLATE_MODES:
+            data={'name':name[:60],'auto_name':True}
+            if not replace_targets:
+                for field,key in (('videos','awemeIds'),('reply_links','replyLinks')):
+                    if job.get(key):data[field]=job[key]
+            if mode=='keyword_reply' and (job.get('settings') or {}).get('fetchKeywords'):
+                data['keywords']=job['settings']['fetchKeywords']
+            return await self.choose_order_template(uid,mode,data)
         data=template_values({'mode':mode,'name':name,'payload':json.dumps({'job':job})})
         if not self.allow_photos(uid):data.pop('photo_mode',None)
         remaining=template_input_steps(mode,data)
@@ -1427,8 +1486,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         pool = await self.review_order_accounts(uid,draft)
         if pool is None:return
         ids,pool_label = pool
-        entries=[('Название',data['name']),('Вид заказа',MODES[mode][0]),
-                 (pool_label,len(ids))]
+        entries=[('Вид заказа',MODES[mode][0]),(pool_label,len(ids))]
         for key,label in (('awemeIds','Видео'),('replyLinks','Ссылки для ответов'),('likeLinks','Ссылки для лайков')):
             if job.get(key):entries.append((label,len(job[key])))
         for key,label in (('commentTexts','Тексты комментариев'),('replyTexts','Тексты ответов')):
@@ -1437,8 +1495,8 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         entries.extend(order_settings_rows(mode,job.get('settings') or {}))
         if job.get('usePhoto'):
             entries.append(('Фото из материалов','Включены'))
-        entries.append(('Запуск','Когда подойдёт очередь' if self.dispatch_active() else 'Отправка приостановлена администратором'))
-        rich,plain=table_html('▤ Проверка копии заказа',entries)
+        launch=order_launch(None,self.cfg.timezone_name,paused=not self.dispatch_active())
+        rich,plain=screen('▤ Проверка копии заказа',entries,subtitle=data['name'],lead=launch)
         token=self.wizard_token(draft)
         await self.tg.rich(uid,rich,plain,keyboard(
             [('✓ Поставить в очередь','wiz:submit:'+token,'success')],
@@ -1450,6 +1508,8 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             return await self.say(uid,'Этот вид заказа доступен только владельцу.')
         draft = self.db.draft(uid)
         if not draft or draft['mode']!='task_copy':return
+        if task_order_mode(job.get('kind',''),job) in COMMENT_TEMPLATE_MODES:
+            return await self.prepare_copy(uid,job,name)
         try:
             ids=self.confirmed_order_accounts(uid,draft)
             if not ids:return await self.create(uid)
@@ -1468,16 +1528,23 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
                 [('↶ К проверке','wiz_continue',None)],[('↶ Мои задачи','tasks',None)]))
 
     async def schedules(self,uid:int):
-        tasks=self.db.recent_tasks(uid,100)
-        tasks=[t for t in tasks if t.get('fire_at') and t['state'] in ('queued','reconcile')]
-        txt='<b>◷ Расписание</b>\n\nЧасовой пояс: '+h(self.cfg.timezone_name)+'\n\n'
+        tasks=sorted((t for t in self.db.recent_tasks(uid,100) if t.get('fire_at') and t['state'] in ('queued','reconcile')),
+                     key=lambda task:task['fire_at'])
+        subtitle='Часовой пояс для ввода дат · '+self.cfg.timezone_name
+        rich,plain=screen('◷ Расписание',subtitle=subtitle)
         rows=[]
         for t in tasks[:20]:
-            txt+=('├ <code>'+t['task_id']+'</code> · '+h(datetime.fromtimestamp(t['fire_at'],self.schedule_zone).strftime('%d.%m %H:%M'))+' · '+h(t['display_name'])+'\n')
-            rows.append([(f'◷ {t["task_id"]} · {t["display_name"][:25]}','task:'+t['task_id'],None)])
-        if not tasks:txt+='Запланированных задач нет.'
-        rows.append([('＋ Создать задачу','create','success')]);rows.append([('↶ Инструменты','tools',None)])
-        await self.say(uid,txt[:3900],keyboard(*rows))
+            name=t['display_name'][:60]
+            date=self.format_date(t['fire_at'])
+            status=' · '+h(state_label(t['state']))
+            rich+='<p><b>'+h(name)+'</b><br>'+rich_time(t['fire_at'],date)+status+'</p>'
+            plain+='\n\n<b>'+h(name)+'</b>\n'+h(date)+status
+            rows.append([('◷ '+name[:45],'task:'+t['task_id'],None)])
+        if not tasks:
+            rich+='<p>Запланированных задач нет.</p>'
+            plain+='\n\nЗапланированных задач нет.'
+        rows.extend([[('＋ Создать задачу','create','success')],[('↶ Инструменты','tools',None)]])
+        await self.tg.rich(uid,rich,plain,keyboard(*rows))
 
     async def settings(self,uid:int):
         if not self.owner(uid):
@@ -1498,9 +1565,11 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             return await self.say(uid,'<b>▷ Публикации · Видео / фото</b>\n\n'
                 'Видео, альбомы и общую очередь ведёт администратор команды.',
                 keyboard([('▣ Мои задачи','tasks','primary')],[('↶ Обзор','home',None)]))
-        await self.say(uid,'<b>▷ Публикации · Видео / фото</b>\n\nПодготовь черновик, создай план и запусти публикацию.',keyboard(
+        if not self.media_orders_visible(uid):
+            return await self.say(uid,'Виды публикаций скрыты в настройках.',keyboard([('▣ Виды заказов','adm:modes',None)]))
+        await self.say(uid,'<b>▷ Публикации</b>\n\nПодготовь черновик, создай план и запусти публикацию.',keyboard(
             [('▧ Черновики','owner_show:drafts','primary')],
-            [('↑ Загрузить видео','upload:video','success'),('＋ Фотоальбом','owner_edit:album',None)],
+            self.media_order_buttons(uid),
             [('＋ Новая публикация','owner_show:drafts',None),('▤ Последний план','owner_show:plan_latest',None)],
             [('▣ Очередь публикаций','owner_show:post_queue',None)],
             [('⚙︎ Настройки','owner_show:posts_settings',None),('▧ Шаблоны подписей','owner_show:post_templates',None)],
@@ -1578,13 +1647,14 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             rich,plain=table_html('▤ '+key,values[:45])
             return await self.tg.rich(uid,rich,plain,keyboard([('↶ Обзор','home',None)]))
         if key=='drafts':
-            items=select_items(result)
+            items=[item for item in select_items(result) if item.get('kind') not in ('video','photo')
+                   or not self.mode_restricted(uid,item['kind']+'_post')]
             visible, page, nav = owner_list_page(items, key, page, 25)
             rows=[]
             for item in visible:
                 oid=str(item.get('id',''))
                 if SAFE_ID.fullmatch(oid):rows.append([(f'▧ {str(item.get("name") or oid)[:36]}','draft:'+oid,None)])
-            rows.extend([nav,[('↑ Видео','upload:video','success'),('＋ Фотоальбом','owner_edit:album',None)]])
+            rows.extend([nav,self.media_order_buttons(uid)])
             rows.append([('↶ Публикации','posts',None)])
             return await self.say(uid,'<b>▧ Черновики</b>\n\n'
                 f'Всего: <code>{number(result.get("total",len(items)))}</code> · стр. {page+1}\n'
@@ -1649,7 +1719,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
                 # Index is resolved against a freshly fetched list at click time.
                 rows.append([(f'⚙︎ {name[:38]} · '+('встроенный' if v.get('builtin') else 'личный'),'preset:'+str(i),None)])
             rows.extend([nav,[('＋ Сохранить','owner_edit:preset_new','success')],[('↶ Настройки','settings',None)]])
-            return await self.say(uid,f'<b>▧ Пресеты API</b>\n\nПресетов: <code>{len(items)}</code> · стр. {page+1}\n'
+            return await self.say(uid,f'<b>▧ Пресеты кабинета</b>\n\nПресетов: <code>{len(items)}</code> · стр. {page+1}\n'
                'Выбери пресет для применения или удаления.',keyboard(*rows))
         if key in ('photos','photos_replies'):
             items=select_items(result)
@@ -1678,7 +1748,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         pid=v['id']
         labels={'id':'ID плана','state':'Статус','postsTotal':'Публикаций','queued':'В очереди',
                 'accepted':'Подошли','skipped':'Пропущено','checked':'Проверено','candidates':'Кандидатов','error':'Ошибка'}
-        fields=[(label,SERVICE_NAME.sub('сервис',str(v[key])) if key=='error' else v[key])
+        fields=[(label,public_system_text(str(v[key])) if key=='error' else v[key])
                 for key,label in labels.items() if key in v and v[key] not in (None,'')]
         states={'checking':'Проверяется','ready':'Готов к запуску','queued':'В очереди',
                 'failed':'Ошибка','canceled':'Отменён','expired':'Срок истёк'}
@@ -1691,21 +1761,40 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         elif state=='ready' and not v.get('postsTotal'):
             fields.append(('Следующий шаг','Проверь черновики и доступные аккаунты'))
         rich,plain=table_html('◷ План публикаций',fields)
-        launch=[('✓ Запустить план','plan_confirm:'+pid,'success')] if post_plan_ready(v) else []
+        launch=[('✓ Запустить план','plan_confirm:'+pid,'success')] if post_plan_ready(v) and self.media_plan_visible(pid,plan=v) else []
         return rich,plain,self.owner_keyboard(launch,
             [('↻ Обновить план','plan:'+pid,None)],
             [('× Удалить план','plan_delete_confirm:'+pid,'danger')],
             [('↶ Публикации','posts',None)])
 
-    async def create_post_plan(self,uid:int,body:dict)->None:
+    def media_plan_visible(self,pid:str,*,plan:dict|None=None)->bool:
+        uid=self.cfg.owner_id
+        kinds=('video','photo')
+        enabled={kind for kind in kinds if not self.mode_restricted(uid,kind+'_post')}
+        if not enabled:return False
+        if len(enabled)==len(kinds):return True
+        registered={kind for kind in kinds if self.db.owned('post_plan_'+kind,pid,uid)}
+        if not registered.issubset(enabled):return False
+        if plan is None:return True
+        drafts=plan.get('drafts')
+        if isinstance(drafts,list) and drafts:
+            visible_kinds=tuple(enabled)
+            return all(isinstance(draft,dict) and draft.get('kind') in visible_kinds for draft in drafts)
+        return bool(registered) and (drafts is None or drafts==[])
+
+    async def create_post_plan(self,uid:int,body:dict,*,kind:str)->None:
         if not self.owner(uid):return
+        if self.mode_restricted(uid,kind+'_post'):
+            raise ValueError('Этот вид публикации скрыт в настройках.')
         self._allowed_fields(body,'PostPlanRequest')
         result=await self.api.call('POST','/v1/posts/plan',payload=body,retries=0)
         draft=self.db.draft(uid)
         if draft and draft['mode']=='owner_edit' and draft['step']=='post_plan':self.db.clear_draft(uid)
         self.db.log(uid,'owner_edit','post_plan')
         pid=str(result.get('id') or '')
-        if SAFE_ID.fullmatch(pid):return await self.show_plan(uid,pid,result)
+        if SAFE_ID.fullmatch(pid):
+            self.db.register_object('post_plan_'+kind,pid,uid)
+            return await self.show_plan(uid,pid,result)
         await self.say(uid,'План принят. Проверь его в разделе «Последний план».',
                        keyboard([('◷ Последний план','owner_show:plan_latest','primary')]))
 
@@ -1725,11 +1814,11 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if album and isinstance(photos,list):
             fields.append(('Фото в альбоме',len(photos)))
         rich,plain=table_html('▧ Черновик',fields)
-        add_photo=[('＋ Добавить фото','upload:album_'+oid,'primary')] if album else []
-        plan=[('◷ Создать план для черновика','draft_plan:'+oid,'success')] if not (album and photos==[]) else []
+        visible=not self.mode_restricted(uid,str(d.get('kind'))+'_post')
+        add_photo=[('＋ Добавить фото','upload:album_'+oid,'primary')] if visible and album else []
+        plan=[('◷ Создать план для черновика','draft_plan:'+oid,'success')] if visible and not (album and photos==[]) else []
         await self.tg.rich(uid,rich,plain,self.owner_keyboard(
-            [('✎ Изменить','owner_edit:draft_'+oid,'primary')],
-            [('▧ Применить шаблон подписи','caption_pick:'+oid+':0',None)],
+            [('✎ Изменить','owner_edit:draft_'+oid,'primary'),('▧ Применить шаблон подписи','caption_pick:'+oid+':0',None)] if visible else [],
             plan,
             add_photo,
             [('× Удалить','draft_delete_confirm:'+oid,'danger')],
@@ -1737,6 +1826,8 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
 
     async def owner_edit(self,uid:int,key:str):
         if not self.owner(uid):return
+        if key=='album' and self.mode_restricted(uid,'photo_post'):
+            return await self.say(uid,'Публикация фотоальбомов скрыта в настройках.')
         if key in ('settings','posts_settings','post_plan'):
             return await self.say(uid,'Этот ввод больше не используется. Создай заказ или выбери черновик публикации: параметры задаются кнопками.',keyboard([('↶ Обзор','home',None)]))
         if key.startswith('draft_'):
@@ -1783,6 +1874,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
                 await self.api.call('POST','/v1/presets',payload={'name':name},retries=0)
                 message='Пресет сохранён.'
             elif step=='album':
+                if self.mode_restricted(uid,'photo_post'):raise ValueError('Публикация фотоальбомов скрыта в настройках.')
                 name=text.strip()
                 if not 1<=len(name)<=80:raise ValueError('Название: до 80 символов')
                 result=await self.api.call('POST','/v1/posts/drafts',payload={'kind':'photo','name':name},retries=0)
@@ -1889,7 +1981,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
 
     @staticmethod
     def result_callback(uid:int,job:dict,action:str)->str:
-        if job.get('workspace'):prefix='tokora_'+action
+        if job.get('workspace'):prefix='cabinet_'+action
         elif job['user_id']!=uid:prefix='adm:'+('job' if action=='task' else action)
         else:prefix=action
         return prefix+':'+job['task_id']
@@ -1974,7 +2066,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         actions=[('⇩ Экспорт','exports:'+tid,'primary')]
         if job['kind'] in PUBLICATION_REPORT_KINDS:
             actions.insert(0,('▥ Отчёт',self.result_callback(uid,job,'report'),None))
-        rows.extend([nav,actions,back])
+        rows.extend([self.collected_reply_button(uid,job),nav,actions,back])
         await self.say(uid,'\n'.join(content),markup(*rows))
 
     async def exports(self,uid:int,tid:str):
@@ -2013,7 +2105,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             rich+='</table>'
             if len(result['items'])>20:rich+='<footer>Показаны первые 20 видео.</footer>'
         markup=self.owner_keyboard if self.owner(uid) else keyboard
-        await self.tg.rich(uid,rich,plain,markup([('▷ Видео заказа','videos:'+tid,None)],
+        await self.tg.rich(uid,rich,plain,markup(self.collected_reply_button(uid,task),[('▷ Видео заказа','videos:'+tid,None)],
             [('↶ Задача',self.result_callback(uid,task,'task'),None)]))
 
     async def export_entries(self, upstream_id:str):
@@ -2093,7 +2185,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if csv_mode:
             writer.writeheader()
             header = b'\xef\xbb\xbf'+buffer.getvalue().encode('utf-8')
-        stem = f'proxima_{tid}_'+('entries' if csv_mode else mode)
+        stem = f'proxima_{public_system_text(tid)}_'+('entries' if csv_mode else mode)
         suffix = '.csv' if csv_mode else '.txt'
         with ExportParts(stem+suffix,header=header,max_bytes=EXPORT_PART_BYTES) as export:
             has_rows=False
@@ -2135,6 +2227,8 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             return await self.proxy_cli_help(uid)
         if kind not in ('video','photo','photo_comments','photo_replies') and not kind.startswith('album_'):return
         if kind.startswith('album_') and not SAFE_ID.fullmatch(kind[6:]):return
+        if self.media_upload_hidden(uid,kind):
+            return await self.say(uid,'Этот вид публикации скрыт в настройках.')
         if kind=='photo':
             return await self.say(uid,'<b>↑ Добавить фото</b>\n\nКуда загрузить?',keyboard(
                 [('▤ Комментарии','upload:photo_comments','primary'),('↪ Ответы','upload:photo_replies',None)],
@@ -2146,14 +2240,20 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         back=[('✓ К черновику','draft:'+kind[6:],'primary')] if kind.startswith('album_') else []
         await self.say(uid,(notice or '<b>↑ Загрузка медиа</b>')+'\n\n'+hint,self.owner_keyboard(back,[('↶ Отмена','discard',None)]))
 
+    def media_upload_hidden(self,uid:int,kind:str)->bool:
+        return ((kind=='video' and self.mode_restricted(uid,'video_post')) or
+                (kind.startswith('album_') and self.mode_restricted(uid,'photo_post')))
+
     async def handle_upload(self,uid:int,msg:dict)->bool:
         d=self.db.draft(uid)
         if not d:return False
         if d['mode']=='account_import':
             await self.account_imports.receive(uid,msg.get('document'))
             return True
-        if (d['mode'] in MODES or d['mode']=='local_template'
-                or (d['mode']=='source_reply' and d['step']=='replies')) and msg.get('document'):
+        if d['mode']=='source_reply' and d['step']=='replies' and msg.get('document'):
+            await self.source_reply_field(uid,error='Выбери одобренный шаблон кнопкой.')
+            return True
+        if (d['mode'] in MODES or d['mode']=='local_template') and msg.get('document'):
             doc=msg['document']
             if not str(doc.get('file_name') or '').lower().endswith('.txt'):
                 await self.say(uid,'Нужен обычный TXT-файл в UTF-8.');return True
@@ -2178,6 +2278,9 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             return True
         if not self.owner(uid) or d['mode']!='upload':return False
         kind=d['step']
+        if self.media_upload_hidden(uid,kind):
+            await self.say(uid,'Этот вид публикации скрыт в настройках.')
+            return True
         photo=msg.get('photo')
         doc=msg.get('document')
         media=msg.get('video') if kind=='video' else (photo[-1] if photo else None)
@@ -2189,6 +2292,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         limit=20*1024*1024 if kind=='video' else 15*1024*1024
         try:
             content,path=await self.tg.fetch_upload(f['file_id'],limit)
+            if self.media_upload_hidden(uid,kind):raise ValueError('Этот вид публикации скрыт в настройках.')
             # Validate bytes; do not trust extension/content-type from Telegram.
             image_type=''
             if content.startswith(b'\xff\xd8\xff'):image_type='image/jpeg'
@@ -2221,7 +2325,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
                     rows.insert(0,[('▧ Открыть черновик','draft:'+str(oid),'primary')])
             else:
                 rows=[[('↶ Материалы','materials',None)]]
-            await self.say(uid,'<b>✓ Файл принят</b>\n'+('ID: <code>'+h(oid)+'</code>' if oid else 'Операция принята API.'),
+            await self.say(uid,'<b>✓ Файл принят</b>\n'+('ID: <code>'+h(oid)+'</code>' if oid else ''),
                             self.owner_keyboard(*rows))
         except (ValueError,ApiError,TelegramError) as exc:
             detail=(safe_api_error(exc.code) if isinstance(exc,ApiError) else
@@ -2321,11 +2425,13 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if action not in action_map:return
         method,path,payload=action_map[action]
         if action=='plan_launch':
+            if not self.media_plan_visible(oid):
+                return await self.say(uid,'Этот вид публикации скрыт в настройках.')
             plan=await self.api.call('GET','/v1/posts/plan/'+q,retries=0)
             if plan.get('id')!=oid:
                 return await self.say(uid,'Не удалось подтвердить ID плана. Обнови карточку.',
                                       self.owner_keyboard([('↻ Обновить план','plan:'+oid,None)]))
-            if not post_plan_ready(plan):
+            if not post_plan_ready(plan) or not self.media_plan_visible(oid,plan=plan):
                 return await self.show_plan(uid,oid,plan)
         try:
             result=await self.api.call(method,path,payload=payload,retries=0)
@@ -2364,7 +2470,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if not self.owner(uid):return
         parts=text.split(maxsplit=2)
         if len(parts)==1:
-            return await self.say(uid,'<b>OpenAPI · просмотр</b>\n'
+            return await self.say(uid,'<b>Диагностика Proxima</b>\n'
                 '<code>/api operationId {"id":"..."}</code>\n\n'
                 'Поддерживаются GET-методы с JSON-ответом.')
         selected=next((operation for _,method,operation in declared_operations()
@@ -2386,13 +2492,13 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
 
         def scrub(value):
             if isinstance(value,dict):
-                return {k:('***' if any(word in k.lower() for word in hidden) else scrub(item))
+                return {('poolLines' if k=='tokoraLines' else public_system_text(k)):
+                            ('***' if any(word in k.lower() for word in hidden) else scrub(item))
                         for k,item in value.items()}
             if isinstance(value,list):return [scrub(item) for item in value[:20]]
-            return value[:300] if isinstance(value,str) else value
+            return TOKEN_TEXT.sub('[ключ скрыт]',public_system_text(value))[:300] if isinstance(value,str) else value
 
-        body=json.dumps(scrub(result),ensure_ascii=False,indent=2).replace('"tokoraLines"','"poolLines"')
-        body=SERVICE_NAME.sub('сервис',body)
+        body=json.dumps(scrub(result),ensure_ascii=False,indent=2)
         await self.say(uid,'<b>▤ '+h(plan['operation'])+'</b>\n<pre>'+h(body[:3350])+'</pre>')
 
     async def admins(self,uid:int)->None:
@@ -2449,9 +2555,9 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             if self.owner(uid) and re.fullmatch(r'[0-9]{1,7}',page):
                 await super().tasks(uid,int(page))
             return
-        if action.startswith(('tokora_task:','tokora_report:')):
+        if action.startswith(('cabinet_task:','cabinet_report:','tokora_task:','tokora_report:')):
             kind,tid = action.split(':',1)
-            return await self.workspace_task(uid,tid,report=kind=='tokora_report')
+            return await self.workspace_task(uid,tid,report=kind.endswith('_report'))
         if action.startswith('task_accounts:'):
             fields=action.split(':')
             if len(fields)==3 and re.fullmatch(r'[0-9]{1,7}',fields[2]):
@@ -2569,7 +2675,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
                 return await self.retry_collection_reply(uid, payload)
             if not self.is_reusable(t):return
             if self.can_replace_order_links(t):
-                return await self.prepare_copy(uid, json.loads(t['payload_json']), t['display_name'])
+                return await self.prepare_copy(uid,json.loads(t['payload_json']),t['display_name'],replace_targets=True)
             if t['state']!='completed':return
             return await self.prepare_copy(uid,json.loads(t['payload_json']),'Повтор · '+t['display_name'][:45])
         if action.startswith('entries:'):
@@ -2628,11 +2734,13 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
                 label='Подтвердить изменение общего кабинета'
                 detail='ID плана или записи · <code>'+h(oid)+'</code>'
                 if internal=='plan_launch':
+                    if not self.media_plan_visible(oid):
+                        return await self.say(uid,'Этот вид публикации скрыт в настройках.')
                     plan=await self.api.call('GET','/v1/posts/plan/'+pth_id(oid),retries=0)
                     if plan.get('id')!=oid:
                         return await self.say(uid,'Не удалось подтвердить ID плана. Обнови карточку.',
                                               self.owner_keyboard([('↻ Обновить план','plan:'+oid,None)]))
-                    if not post_plan_ready(plan):
+                    if not post_plan_ready(plan) or not self.media_plan_visible(oid,plan=plan):
                         return await self.show_plan(uid,oid,plan)
                     label='Поставить публикации в очередь'
                     detail='Будет поставлено в очередь · <b>'+number(plan['postsTotal'])+'</b> публикаций.'
@@ -2677,7 +2785,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
     async def command(self,uid:int,text:str)->bool:
         if await self.admin_command(uid,text):return True
         cmd=text.split(maxsplit=1)[0].lower().split('@')[0]
-        if cmd=='/cancel' and self.owner(uid):self.account_imports.clear_preview()
+        if cmd=='/cancel':self.account_imports.clear_preview(uid)
         if cmd=='/promo':
             fields=text.split()
             if len(fields)!=2 or not re.fullmatch(r'[a-fA-F0-9]{16}',fields[1]):
@@ -2691,7 +2799,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             if not self.owner(uid):return True
             parts=text.split(maxsplit=2)
             if len(parts)<2:
-                await self.say(uid,'<b>▣ Расширенные операции OpenAPI</b>\n\n'
+                await self.say(uid,'<b>▣ Расширенные операции Proxima</b>\n\n'
                     'Только администратор. Команда:\n'
                     '<code>/op getPostsById {"path":{"id":"POST_ID"}}</code>\n\n'
                     'Для изменения общего кабинета требуется отдельное подтверждение. '\
@@ -2802,7 +2910,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             if self.mode_restricted(uid,'source_reply'):
                 return await self.say(uid,'Этот вид заказа доступен только владельцу.')
             tid=data[len('source_reply:'):]
-            source=self.db.task(tid,uid)
+            source=await self.reply_source(uid,tid)
             if not self.is_reply_source(source):
                 return await self.say(uid,'Доступен только завершённый собственный сбор.')
             if not self.db.is_active(uid,self.cfg.owner_id):return await self.access(uid)
@@ -2861,13 +2969,12 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
                     data.pop('target_ids',None)
                     data.pop('target_cids',None)
                     data['options']={key:value for key,value in (data.get('options') or {}).items() if key!='targetCount'}
-                    next_step='review' if data.pop('review_edit',False) else 'options' if data.get('replies') else 'replies'
+                    selected=self.approved_order_template(uid,'source_reply',data)
+                    next_step='review' if selected and data.pop('review_edit',False) else 'options' if selected else 'replies'
                     self.save_wizard_step(uid,'source_reply',next_step,data)
                     return await self.source_reply_field(uid)
                 if d['step']=='replies':
-                    data['replies']=limited_lines(text,100,700)
-                    self.save_wizard_step(uid,'source_reply','options',data)
-                    return await self.source_reply_field(uid)
+                    return await self.source_reply_field(uid,error='Выбери одобренный шаблон кнопкой.')
                 if d['step']=='options':
                     selected=next((item for item in order_fields('source_reply',data) if item.key==data.get('form_field')),None)
                     if selected:
@@ -2886,6 +2993,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if not self.db.is_active(uid,self.cfg.owner_id):return await self.access(uid)
         draft=self.db.draft(uid)
         if not draft or draft['mode']!='source_reply':return await self.tasks(uid)
+        if self.mode_restricted(uid,'source_reply'):return
         step,data=draft['step'],draft['data']
         _,_,suffix=action.partition(':')
         verb,_,token=suffix.partition(':')
@@ -2895,19 +3003,16 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             return await self.source_reply_field(uid,page=int(verb[8:]))
         if verb.startswith('tpl_') and step=='replies':
             item=self.db.template(uid,verb[4:])
-            values=template_values(item) if item else {}
-            if not values.get('replies') or 'replies' in values.get('disabled_fields',[]):
+            if not template_matches(item,'source_reply'):
                 return await self.source_reply_field(uid,error='Шаблон ответов недоступен.')
-            data['replies']=values['replies']
+            values=template_order_values(item,'source_reply')
+            data.update({key:values[key] for key in ('comments','replies','disabled_fields','approved_template','options') if key in values})
             self.save_wizard_step(uid,'source_reply','options',data)
             return await self.source_reply_field(uid)
         if step=='options' and await self.order_form_action(uid,'source_reply',data,verb,prefix='source'):return
         if verb=='cancel':
             self.db.clear_draft(uid)
-            return await self.task(uid,data['source_task'])
-        if verb=='keep_replies' and step=='replies' and data.get('replies'):
-            self.save_wizard_step(uid,'source_reply','options',data)
-            return await self.source_reply_field(uid)
+            return await self.open_reply_source(uid,data['source_task'])
         if verb=='back':
             previous={'replies':'target_count','options':'replies','review':'options'}.get(step)
             if step=='target_count' and data.pop('review_edit',False):previous='review'
@@ -2928,8 +3033,8 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             self.save_wizard_step(uid,'source_reply','review',{**data,'photo_mode':setting})
             return await self.source_reply_preview(uid)
         if verb=='template' and step=='review':
-            saved={key:data[key] for key in ('replies','options','photo_mode') if key in data}
-            return await self.save_order_template(uid,'Ответы на собранное','source_reply',saved,'source:review:'+token)
+            self.save_wizard_step(uid,'source_reply','replies',data)
+            return await self.source_reply_field(uid)
         if verb=='review' and step=='review':return await self.source_reply_preview(uid)
 
     async def source_template_orders(self,uid:int,tid:str,page:int=0)->None:
@@ -2937,7 +3042,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if self.mode_restricted(uid,'source_reply'):
             return await self.say(uid,'Этот вид заказа доступен только владельцу.')
         item=self.db.template(uid,tid)
-        if not item or item['mode']!='source_reply':return await self.say(uid,'Шаблон не найден.')
+        if not template_matches(item,'source_reply'):return await self.say(uid,'Нужен одобренный шаблон с ответами.')
         size=10
         sources=self.db.completed_collections(uid,size+1,page*size)
         rows=[[(f'▤ {source["display_name"][:38]} · {source["task_id"]}',
@@ -2953,17 +3058,42 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         if self.mode_restricted(uid,'source_reply'):
             return await self.say(uid,'Этот вид заказа доступен только владельцу.')
         item=self.db.template(uid,tid)
-        source=self.db.task(source_id,uid)
-        if not item or item['mode']!='source_reply' or not self.is_reply_source(source):
+        source=await self.reply_source(uid,source_id)
+        if not template_matches(item,'source_reply') or not self.is_reply_source(source):
             return await self.say(uid,'Шаблон или исходный сбор недоступен.')
         if not self.has_order_pool(uid):return await self.create(uid)
-        data=json.loads(item['payload'])
+        data=template_order_values(item,'source_reply')
         self.save_wizard_step(uid,'source_reply','target_count',{**data,'source_task':source_id})
         await self.source_reply_field(uid)
 
     @staticmethod
     def is_reply_source(source:dict|None)->bool:
         return bool(source and source['kind']=='fetch' and source['state']=='completed' and source['upstream_id'])
+
+    def collected_reply_button(self,uid:int,source:dict)->list[tuple]:
+        if self.is_reply_source(source) and not self.mode_restricted(uid,'source_reply'):
+            return [('↪ Ответить на собранные комментарии','source_reply:'+source['task_id'],'success')]
+        return []
+
+    def reply_topup_template_allowed(self,uid:int,source:dict)->bool:
+        texts=(json.loads(source['payload_json']).get('assets') or {}).get('replyTexts')
+        return bool(texts and any(template_texts(template_values(item))['replies']==texts
+                                  for item in self.matching_order_templates(uid,'reply_links')))
+
+    async def reply_source(self,uid:int,tid:str)->dict|None:
+        if not SAFE_ID.fullmatch(tid):return None
+        try:
+            return await self.result_order(uid,tid)
+        except ApiError:
+            return None
+
+    async def open_reply_source(self,uid:int,tid:str)->None:
+        source=await self.reply_source(uid,tid)
+        if source:
+            if source.get('workspace'):return await self.workspace_task(uid,tid)
+            if source['user_id']==uid:return await self.task(uid,tid)
+            if self.owner(uid):return await self.admin_job(uid,tid)
+        await self.tasks(uid)
 
     async def retry_collection_reply(self, uid: int, payload: dict) -> None:
         if not self.db.is_active(uid, self.cfg.owner_id):
@@ -2973,24 +3103,27 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         source = self.db.task_by_upstream(payload['sourceJob'], uid)
         if not self.is_reply_source(source):
             return await self.say(uid, 'Исходный сбор недоступен.')
-        self.save_wizard_step(uid, 'source_reply', 'review', {
+        self.save_wizard_step(uid, 'source_reply', 'replies', {
             'source_task': source['task_id'],
             'target_count': len(payload['targetIds']),
             'target_ids': payload['targetIds'],
-            'replies': payload['assets']['replyTexts'],
             'options': payload.get('settings', {}),
             'photo_mode': 'replies' if self.allow_photos(uid) and payload.get('usePhoto') else 'off',
         })
-        await self.source_reply_preview(uid)
+        await self.source_reply_field(uid)
 
     async def source_reply_field(self,uid:int,*,error:str='',page:int=0):
         draft=self.db.draft(uid)
         if not draft or draft['mode']!='source_reply':return
+        if self.mode_restricted(uid,'source_reply'):return
         step=draft['step']
         if step=='review':return await self.source_reply_preview(uid)
         token=self.wizard_token(draft)
         data=draft['data']
         if step=='options':
+            if not self.approved_order_template(uid,'source_reply',data):
+                self.save_wizard_step(uid,'source_reply','replies',data)
+                return await self.source_reply_field(uid)
             return await self.order_form_field(uid,'source_reply',data,token,error=error,prefix='source')
         if step=='target_count':
             text='<b>↪ Ответить на собранные комментарии</b>\n\nНа сколько комментариев ответить? Введи число от 1 до 100 000. Учитываются только комментарии верхнего уровня.'
@@ -2998,7 +3131,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             if data.get('review_edit'):
                 rows.insert(0,[('↶ К проверке','source:back:'+token,None)])
         elif step=='replies':
-            text='<b>↪ Ответы на собранное</b>\nМатериалы · Тексты ответов\n\nОтправь тексты сообщением или TXT, один ответ на строку.'
+            text='<b>↪ Ответы на собранное</b>\n\nВыбери одобренный шаблон с ответами.'
             items=self.matching_order_templates(uid,'source_reply')
             size=10
             page=max(0,min(page,(len(items)-1)//size))
@@ -3008,7 +3141,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             if page:nav.append(('← Ранее',f'source:tplpage_{page-1}:{token}',None))
             if (page+1)*size<len(items):nav.append(('→ Далее',f'source:tplpage_{page+1}:{token}',None))
             rows.append(nav)
-            if data.get('replies'):rows.insert(0,[('✓ Оставить тексты','source:keep_replies:'+token,'primary')])
+            if not items:rows.append([('＋ Создать шаблон ответов','tpl_new:reply',None)])
             rows.append([('↶ К количеству','source:back:'+token,None),('× Отменить','source:cancel:'+token,None)])
         else:
             text=('<b>↪ Ответы на собранное</b>\nШаг 2 из 2 · Настройки\n\n'
@@ -3024,25 +3157,29 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
                 rich+='<p>Текущее количество · <b>'+count+'</b></p>'
                 text+='\n\nТекущее количество · <b>'+count+'</b>'
         else:
-            rich+='<h3>Тексты ответов</h3><p>Отправь тексты сообщением или TXT, один ответ на строку. Можно выбрать шаблон ниже.</p>'
+            rich+='<h3>Шаблон ответов</h3><p>Выбери одобренный шаблон с ответами.</p>'
         if error:rich+='<blockquote><b>Проверь ввод</b><br>'+h(error)+'</blockquote>'
         await self.tg.rich(uid,rich,text,keyboard(*rows))
 
     async def source_reply_preview(self,uid:int):
         d=self.db.draft(uid)
         if not d or d['mode']!='source_reply':return
+        template=self.approved_order_template(uid,'source_reply',d['data'])
+        if not template:
+            self.save_wizard_step(uid,'source_reply','replies',d['data'])
+            return await self.source_reply_field(uid)
         d['data']=complete_order_form('source_reply',d['data'])
         if not reply_quantity(d['data']):
             self.save_wizard_step(uid,'source_reply','options',d['data'])
             return await self.source_reply_field(uid,error='Укажи хотя бы один ответ на комментарий.')
         self.db.save_draft(uid,'source_reply','review',d['data'])
-        src=self.db.task(d['data']['source_task'],uid)
+        src=await self.reply_source(uid,d['data']['source_task'])
         if not self.is_reply_source(src):return await self.say(uid,'Исходный сбор недоступен.')
         pool = await self.review_order_accounts(uid,d)
         if pool is None:return
         ids,pool_label = pool
         token=self.wizard_token(d)
-        rows=[('Сбор',src['task_id']),('Текстов',len(d['data']['replies'])),(pool_label,len(ids)),
+        rows=[('Одобренный шаблон',template['name']),('Сбор',src['task_id']),('Текстов',len(d['data']['replies'])),(pool_label,len(ids)),
               *form_rows('source_reply',d['data'])]
         with_photo=self.allow_photos(uid) and d['data'].get('photo_mode')=='replies'
         if self.allow_photos(uid):rows.append(('Фото из материалов','В ответы' if with_photo else 'Без фото'))
@@ -3087,7 +3224,8 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
         replies_per_comment=(d['data'].get('options') or {}).get('repliesPerComment') or 0
         if len(selected)*replies_per_comment>per_video_cap:
             rows.append(('Лимит ответов на видео',number(per_video_cap)))
-        rich,plain=screen('↪ Проверка ответов',rows,stage=3,
+        launch=order_launch(None,self.cfg.timezone_name,paused=not self.dispatch_active())
+        rich,plain=screen('↪ Проверка ответов',rows,stage=3,lead=launch,
                           caption=f'Ответы появятся под выбранными комментариями. Лимит выполнения — {minutes_label(limit_min)} с начала публикаций.')
         preview='\n'.join(text[:160] for text in d['data']['replies'][:5])+f'\nПоказано {min(5,len(d["data"]["replies"]))} из {len(d["data"]["replies"])} вариантов.'
         rich+='<h3>Ответы, которые будут использованы</h3><p>'+h(preview)+'</p>'
@@ -3096,7 +3234,7 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             [('✓ Поставить в очередь','source:submit:'+token,'success')],
             [('✎ Количество комментариев','source:edit_targets:'+token,None)],
             [('▧ Убрать фото' if with_photo else '▧ Фото в ответы','source:photo:'+token,None)] if self.allow_photos(uid) else [],
-            [('▧ Сохранить шаблон','source:template:'+token,None)],
+            [('▧ Выбрать другой шаблон','source:template:'+token,None)],
             [('↶ Назад','source:back:'+token,None),('× Отменить','source:cancel:'+token,'danger')]))
 
     async def submit_source_reply(self,uid:int):
@@ -3105,7 +3243,8 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
             return await self.say(uid,'Этот вид заказа доступен только владельцу.')
         d=self.db.draft(uid)
         if not d or d['mode']!='source_reply' or d['step']!='review':return
-        src=self.db.task(d['data']['source_task'],uid)
+        if not self.approved_order_template(uid,'source_reply',d['data']):return await self.source_reply_preview(uid)
+        src=await self.reply_source(uid,d['data']['source_task'])
         if not self.is_reply_source(src):return await self.say(uid,'Исходный сбор недоступен.')
         data=complete_order_form('source_reply',d['data'])
         if not self.allow_photos(uid):data={**data,'photo_mode':'off'}
@@ -3127,7 +3266,8 @@ class ProximaApp(MediaOrderFormMixin, LocalTemplatesMixin, AccountConsoleMixin, 
                            repliesPerVideo=min(TASK_LIMITS['repliesPerVideo'],len(targets)*options['repliesPerComment']))
             payload['settings']=validate_task_options(options)
             tid=self.db.queue_task(uid,'Ответы · '+src['display_name'][:45],'publish',payload,
-                max_daily=self.cfg.max_tasks_per_day,max_open=self.cfg.max_open_tasks,draft_token=self.wizard_token(d))
+                max_daily=self.cfg.max_tasks_per_day,max_open=self.cfg.max_open_tasks,draft_token=self.wizard_token(d),
+                template_allowed=lambda:bool(self.approved_order_template(uid,'source_reply',data)))
             return await self.task(uid,tid)
         except ValueError as exc:return await self.say(uid,'Нельзя создать: '+h(exc),keyboard(
             [('↻ К проверке','wiz_continue','primary')]))

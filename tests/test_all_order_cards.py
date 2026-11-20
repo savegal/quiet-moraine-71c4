@@ -41,7 +41,7 @@ def test_every_workspace_order_has_metrics_controls_and_private_results(kind,sna
             assert len(calls)==before
             await app.task_entries(99,'remote-job')
             assert 'Результат' in app.tg.out[-1][1]
-            assert 'tokora_task:remote-job' in str(app.tg.out[-1][2])
+            assert 'cabinet_task:remote-job' in str(app.tg.out[-1][2])
             await app.export_file(99,'remote-job','csv')
             assert len(app.tg.documents)==1
         finally:

@@ -12,7 +12,7 @@ from .api import ACCOUNT_PAGE_SIZE, ApiError
 from .bot import safe_api_error
 from .db import now
 from .operations import VALID_ID
-from .presentation import error_breakdown, h, keyboard, number, pagination, rich_table, table_html
+from .presentation import error_breakdown, h, keyboard, number, pagination, public_system_text, rich_table, table_html
 
 PROXY_LIST = '/v1/proxies'
 PROXY_CHECK = '/v1/proxies/check'
@@ -560,7 +560,7 @@ class ProxyConsoleMixin:
             if exc.status==403:
                 message = 'У ключа API нет права на эту операцию или на одну из проверок перед ней.'
             if exc.request_id:
-                message += f'\nID запроса · <code>{h(exc.request_id)}</code>'
+                message += f'\nID запроса · <code>{h(public_system_text(exc.request_id))}</code>'
             await self.say(uid,message,keyboard([('↶ Прокси',PROXY_MENU,None)]))
         except ValueError as exc:
             await self.say(uid,h(exc),keyboard([('↶ Прокси',PROXY_MENU,None)]))

@@ -4,11 +4,12 @@ from html.parser import HTMLParser
 
 import pytest
 
-from proxima_bot.api import TelegramError
+from proxima_bot.api import ApiError, TelegramError
 from proxima_bot.catalog import MODES, OWNER_ONLY
+from proxima_bot.db import now
 from proxima_bot.rich_ui import button_row, screen
 from proxima_bot.order_templates import template_screen
-from test_extended import new_app
+from test_extended import approved_order_data, new_app, seed_approved_template
 from test_guided_order_form import click, options
 from test_order_flows import COMMENT, SCENARIOS
 from test_release_flows import TelegramTransport
@@ -17,7 +18,7 @@ from test_release_flows import TelegramTransport
 class NativeRich(HTMLParser):
     """Validate the documented subset used by these screens, including callbacks."""
     allowed={'h2','h3','p','b','i','code','footer','br','hr','table','tr','td','th',
-             'details','summary','tg-button-row','tg-button','ul','li','ol','blockquote','a'}
+             'details','summary','tg-button-row','tg-button','tg-time','ul','li','ol','blockquote','a'}
 
     def __init__(self):
         super().__init__()
@@ -115,12 +116,16 @@ def test_create_catalog_preserves_all_actions_in_native_and_basic_layouts(uid,ri
         app=new_app()
         try:
             app.tg=TelegramTransport(rich)
+            app.save_wizard_step(uid,'publish','name',{})
             await app.create(uid)
             method,payload=app.tg.calls[-1]
             actions=validate_rich(payload) if rich else keyboard_callbacks(payload)
             assert {item for item in actions if item.startswith('new:')}=={
                 'new:'+mode for mode in MODES if uid==99 or mode not in OWNER_ONLY}
-            assert {'templates','home'}<=actions
+            assert {'wiz_continue','templates','home'}<=actions
+            if rich:
+                body=payload['rich_message']['html']
+                assert body.index('wiz_continue') < body.index('new:publish')
             if uid==99:assert {'upload:video','owner_edit:album'}<=actions
             assert method==('sendRichMessage' if rich else 'sendMessage')
         finally:app.db.close()
@@ -152,11 +157,48 @@ def test_order_volume_and_review_are_valid_native_rich_with_all_editors(mode):
 
 
 @pytest.mark.parametrize('rich', [True,False])
+def test_scheduled_order_keeps_launch_notice_and_actions_in_both_layouts(rich):
+    async def run():
+        app=new_app()
+        try:
+            fire_at=now()+3600
+            app.save_wizard_step(7,'publish','review',approved_order_data(app,7,'publish',{
+                'name':'Запланированный заказ','videos':['7420000000000000000'],
+                'comments':['Текст'],'fire_at':fire_at,
+            }))
+            app.tg=TelegramTransport(rich)
+            await app.preview(7)
+            payload=app.tg.calls[-1][1]
+            actions=validate_rich(payload) if rich else keyboard_callbacks(payload)
+            text=payload['rich_message']['html'] if rich else payload['text']
+            assert text.index('Запуск очереди приостановлен') < text.index('Вид заказа')
+            assert 'не раньше' in text and app.format_date(fire_at) in text
+            assert (f'<tg-time unix="{fire_at}" format="dt">' in text)==rich
+            submit=next(action for action in actions if action.startswith('wiz:submit:'))
+            await app.callback(7,{'data':submit})
+            task,=app.db.recent_tasks(7)
+            assert task['fire_at']==fire_at
+            card,plain,_=app.render_task(task)
+            assert f'<tg-time unix="{fire_at}"' in card
+            assert all(view.index('Запуск приостановлен') < view.index('Вид заказа') for view in (card,plain))
+            assert 'Ожидание свободной очереди' not in card
+            earlier=app.db.queue_task(7,'Более ранний заказ','fetch',{'assets':{'accountIds':['acc7']}},fire_at=fire_at-1800)
+            await app.schedules(7)
+            payload=app.tg.calls[-1][1]
+            actions=validate_rich(payload) if rich else keyboard_callbacks(payload)
+            text=payload['rich_message']['html'] if rich else payload['text']
+            assert text.index('Более ранний заказ') < text.index('Запланированный заказ')
+            assert {'task:'+earlier,'task:'+task['task_id']}<=actions
+        finally:app.db.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('rich', [True,False])
 def test_template_list_keeps_navigation_and_escaped_names(rich):
     async def run():
         app=new_app()
         try:
-            tids=[app.db.save_template(7,'Название <>& '+str(i),'publish',{'draft':{'replies':['Ответ']}}) for i in range(12)]
+            tids=[seed_approved_template(app,7,'Название <>& '+str(i),'publish',{'draft':{'replies':['Ответ']}}) for i in range(12)]
             tids=[item['template_id'] for item in app.db.templates(7)]
             app.tg=TelegramTransport(rich)
             await app.templates(7)
@@ -262,7 +304,7 @@ def test_restricted_modes_hide_and_block_member_access_but_keep_owner_access():
             await app.edit_local_template(7,'fetch')
             assert app.db.draft(7) is None
 
-            tid=app.db.save_template(7,'Старый парсер','fetch',{'draft':{'fetch_count':100}})
+            tid=seed_approved_template(app,7,'Старый парсер','fetch',{'draft':{'fetch_count':100}})
             await app.from_template(7,tid)
             assert app.db.draft(7) is None
 
@@ -313,6 +355,9 @@ def test_admin_queue_and_folder_sync_screens_are_valid_native_rich():
         async def api_call(method,path,**kwargs):
             if path=='/v1/account-folders':
                 return {'available':True,'unassigned':1,'items':[{'id':'1234abcd','name':'Папка <A>','count':2,'active':2}]}
+            if method=='GET' and path=='/v1/tasks':
+                return {'items':[{'id':'remote1','state':'running'},{'id':'external','state':'paused'},
+                                 {'id':'import','state':'running','kind':'import'}],'more':False}
             raise AssertionError(path)
 
         async def in_folder(fid):
@@ -322,11 +367,15 @@ def test_admin_queue_and_folder_sync_screens_are_valid_native_rich():
         app.api.accounts_in_folder=in_folder
         try:
             await app.callback(99,{'data':'admin'})
-            assert 'adm:liveq:0' in validate_rich(app.tg.calls[-1][1])
+            assert {'adm:liveq:0','ac:folders:0'}<=validate_rich(app.tg.calls[-1][1])
             await app.callback(99,{'data':'adm:liveq:0'})
             q_actions=validate_rich(app.tg.calls[-1][1])
             assert {'adm:lqpause:on',f'adm:job:{tid}'}<=q_actions
-            assert 'Подготовка' in app.tg.calls[-1][1]['rich_message']['html']
+            queue_html=app.tg.calls[-1][1]['rich_message']['html']
+            assert 'Подготовка' in queue_html
+            assert 'Лимит слотов бота · <b>5</b>' in queue_html
+            assert 'Занято всего · <b>2</b>' in queue_html and 'Свободно по лимиту · <b>3</b>' in queue_html
+            assert 'Другие задачи кабинета · <b>1</b>' in queue_html
             await app.callback(99,{'data':'adm:foldersync:7'})
             fs_actions=validate_rich(app.tg.calls[-1][1])
             assert 'adm:fsp:7:1234abcd' in fs_actions
@@ -345,6 +394,36 @@ def test_admin_queue_and_folder_sync_screens_are_valid_native_rich():
             folders_cb=next(c for c in imp_actions if c.startswith('acctimp:folders:'))
             await app.callback(99,{'data':folders_cb})
             validate_rich(app.tg.calls[-1][1])
+        finally:app.db.close()
+
+    asyncio.run(run())
+
+
+def test_admin_queue_retains_local_counts_and_order_actions_without_api_or_rich():
+    async def run():
+        app=new_app()
+        app.tg=TelegramTransport(False)
+
+        async def unavailable(method,path,**kwargs):
+            assert (method,path)==('GET','/v1/tasks')
+            raise ApiError('connection_unavailable',503)
+
+        app.api.call=unavailable
+        try:
+            payload={'assets':{'accountIds':['acc7']}}
+            running=app.db.queue_task(7,'Текущий заказ','fetch',payload)
+            waiting=app.db.queue_task(7,'Тот же пул','fetch',payload)
+            app.db.transition(running,'running',upstream_id='remote1')
+            await app.callback(99,{'data':'adm:liveq:0'})
+            method,response=app.tg.calls[-1]
+            assert method=='sendMessage'
+            assert {'adm:liveq:0','adm:lqpause:on',f'adm:job:{running}',f'adm:job:{waiting}'}<=keyboard_callbacks(response)
+            assert 'Показаны только заказы бота' in response['text']
+            assert 'Занято заказами бота · <b>1</b>' in response['text']
+            assert 'Ожидают запуска · <b>1</b>' in response['text']
+            assert 'Свободно по лимиту' not in response['text']
+            assert '\nВ очереди' in response['text']
+            assert 'Ждёт освобождения аккаунтов' not in response['text']
         finally:app.db.close()
 
     asyncio.run(run())

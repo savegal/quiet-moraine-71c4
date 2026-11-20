@@ -19,6 +19,11 @@ class ExtendedStore(Store):
           user_id INTEGER NOT NULL, template_id TEXT NOT NULL, name TEXT NOT NULL,
           mode TEXT NOT NULL, payload TEXT NOT NULL, created_at INTEGER NOT NULL,
           PRIMARY KEY(user_id,template_id));
+        CREATE TABLE IF NOT EXISTS template_reviews (
+          user_id INTEGER NOT NULL, template_id TEXT NOT NULL, revision TEXT NOT NULL UNIQUE,
+          name TEXT NOT NULL, mode TEXT NOT NULL, payload TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('pending','rejected')),
+          PRIMARY KEY(user_id,template_id));
         CREATE TABLE IF NOT EXISTS external_objects (
           kind TEXT NOT NULL, external_id TEXT NOT NULL, user_id INTEGER NOT NULL,
           created_at INTEGER NOT NULL, PRIMARY KEY(kind,external_id));
@@ -50,6 +55,8 @@ class ExtendedStore(Store):
         CREATE TABLE IF NOT EXISTS account_import_items (
           import_id TEXT NOT NULL, account_id TEXT NOT NULL, ready INTEGER NOT NULL,
           PRIMARY KEY(import_id,account_id));
+        CREATE TABLE IF NOT EXISTS member_import_folders (
+          user_id INTEGER PRIMARY KEY, folder_id TEXT NOT NULL UNIQUE);
         ''')
         columns={r[1] for r in self.conn.execute('PRAGMA table_info(users)')}
         for key,definition in {
@@ -65,6 +72,12 @@ class ExtendedStore(Store):
         tpl_columns={r[1] for r in self.conn.execute('PRAGMA table_info(user_templates)')}
         if 'is_shared' not in tpl_columns:
             self.conn.execute('ALTER TABLE user_templates ADD COLUMN is_shared INTEGER NOT NULL DEFAULT 0')
+        if 'approved_revision' not in tpl_columns:
+            with self._write_transaction():
+                self.conn.execute('ALTER TABLE user_templates ADD COLUMN approved_revision TEXT')
+                self.conn.execute('''INSERT INTO template_reviews
+                    SELECT user_id,template_id,lower(hex(randomblob(6))),name,mode,payload,'pending'
+                    FROM user_templates''')
         for row in self.conn.execute("SELECT user_id,username,full_name FROM users WHERE search_text='' AND (username!='' OR full_name!='')").fetchall():
             self.conn.execute('UPDATE users SET search_text=? WHERE user_id=?',
                 ((row['username']+' '+row['full_name']).casefold(),row['user_id']))
@@ -90,14 +103,30 @@ class ExtendedStore(Store):
         self.conn.execute('UPDATE account_imports SET state=?,summary_json=? WHERE import_id=?',
                           (state,json.dumps(summary,ensure_ascii=False),import_id))
 
-    def account_import(self,owner_id:int,*,import_id:str|None=None,target_id:int|None=None)->dict|None:
+    def account_import(self,owner_id:int,*,import_id:str|None=None,target_id:int|None=None,admin:bool=False)->dict|None:
+        access=() if admin else (owner_id,)
+        where='' if admin else ' AND owner_id=?'
         if import_id:
-            row=self.conn.execute('SELECT * FROM account_imports WHERE owner_id=? AND import_id=?',
-                                  (owner_id,import_id)).fetchone()
+            row=self.conn.execute('SELECT * FROM account_imports WHERE import_id=?'+where,(import_id,*access)).fetchone()
         else:
-            row=self.conn.execute('SELECT * FROM account_imports WHERE owner_id=? AND target_id=? ORDER BY rowid DESC LIMIT 1',
-                                  (owner_id,target_id)).fetchone()
+            row=self.conn.execute('SELECT * FROM account_imports WHERE target_id=?'+where+' ORDER BY rowid DESC LIMIT 1',
+                                  (target_id,*access)).fetchone()
         return {**dict(row),'summary':json.loads(row['summary_json'])} if row else None
+
+    def member_import_folder(self,uid:int)->str|None:
+        row=self.conn.execute('SELECT folder_id FROM member_import_folders WHERE user_id=?',(uid,)).fetchone()
+        return row['folder_id'] if row else None
+
+    def member_import_folder_assignee(self,folder_id:str)->int|None:
+        row=self.conn.execute('SELECT user_id FROM member_import_folders WHERE folder_id=?',(folder_id,)).fetchone()
+        return row['user_id'] if row else None
+
+    def bind_member_import_folder(self,uid:int,folder_id:str)->None:
+        try:
+            self.conn.execute('INSERT INTO member_import_folders VALUES (?,?) '
+                              'ON CONFLICT(user_id) DO UPDATE SET folder_id=excluded.folder_id',(uid,folder_id))
+        except sqlite3.IntegrityError as exc:
+            raise ValueError('Эта папка уже привязана к другому траферу.') from exc
 
     def save_account_import_item(self,import_id:str,account_id:str,ready:bool)->None:
         self.conn.execute('INSERT OR IGNORE INTO account_import_items VALUES (?,?,?)',
@@ -148,8 +177,8 @@ class ExtendedStore(Store):
         self.conn.execute('DELETE FROM external_objects WHERE kind=? AND external_id=? AND user_id=?',
                           (kind,object_id,uid))
 
-    def save_template(self,uid:int,name:str,mode:str,payload:dict,*,template_id:str|None=None,draft_token:str|None=None)->str:
-        import secrets
+    def save_template(self,uid:int,name:str,mode:str,payload:dict,*,template_id:str|None=None,
+                      draft_token:str|None=None)->str:
         if len(name)>64 or not name.strip():raise ValueError('Название шаблона должно содержать от 1 до 64 символов.')
         data=json.dumps(payload,ensure_ascii=False)
         if len(data)>512_000:raise ValueError('Шаблон слишком большой. Сократи список ссылок или текстов.')
@@ -161,16 +190,22 @@ class ExtendedStore(Store):
                         or draft['data'].get('token')!=draft_token
                         or draft['data'].get('template_id')!=template_id):
                     raise ValueError('Подтверждение устарело. Открой шаблон заново.')
+            revision=secrets.token_hex(6)
             if template_id is not None:
-                changed=self.conn.execute('UPDATE user_templates SET name=?,mode=?,payload=? WHERE user_id=? AND template_id=?',
-                                          (name.strip(),mode,data,uid,template_id)).rowcount
-                if not changed:raise ValueError('Шаблон больше не существует.')
+                if not self.template(uid,template_id,owned_only=True):
+                    raise ValueError('Шаблон больше не существует.')
             else:
                 count=self.conn.execute('SELECT COUNT(*) FROM user_templates WHERE user_id=?',(uid,)).fetchone()[0]
                 if count>=50:raise ValueError('Максимум 50 шаблонов')
                 template_id=secrets.token_hex(4)
-                self.conn.execute('INSERT INTO user_templates(user_id,template_id,name,mode,payload,created_at,is_shared) VALUES (?,?,?,?,?,?,0)',
-                                  (uid,template_id,name.strip(),mode,data,now()))
+                self.conn.execute('''INSERT INTO user_templates
+                    (user_id,template_id,name,mode,payload,created_at) VALUES (?,?,?,?,?,?)''',
+                    (uid,template_id,name.strip(),mode,data,now()))
+            self.conn.execute('''INSERT INTO template_reviews VALUES (?,?,?,?,?,?,'pending')
+                ON CONFLICT(user_id,template_id) DO UPDATE SET revision=excluded.revision,name=excluded.name,
+                mode=excluded.mode,payload=excluded.payload,state='pending' ''',
+                (uid,template_id,revision,name.strip(),mode,data))
+            self.log(uid,'template_submitted',template_id)
             if draft_token is not None:self.clear_draft(uid)
             self.conn.execute('COMMIT')
         except Exception:
@@ -178,17 +213,44 @@ class ExtendedStore(Store):
             raise
         return template_id
 
+    def template_review(self,uid:int,tid:str)->dict|None:
+        row=self.conn.execute('SELECT * FROM template_reviews WHERE user_id=? AND template_id=?',(uid,tid)).fetchone()
+        return dict(row) if row else None
+
+    def pending_template_reviews(self,limit:int,offset:int=0)->list[dict]:
+        return [dict(row) for row in self.conn.execute(
+            "SELECT * FROM template_reviews WHERE state='pending' ORDER BY rowid DESC LIMIT ? OFFSET ?",(limit,offset))]
+
+    def pending_template_review(self,revision:str)->dict|None:
+        row=self.conn.execute("SELECT * FROM template_reviews WHERE revision=? AND state='pending'",(revision,)).fetchone()
+        return dict(row) if row else None
+
+    def decide_template_review(self,actor:int,revision:str,approve:bool)->dict|None:
+        if actor!=getattr(self,'owner_id',None):return None
+        with self._write_transaction():
+            proposed=self.pending_template_review(revision)
+            if not proposed:return None
+            uid,tid=proposed['user_id'],proposed['template_id']
+            if approve:
+                self.conn.execute('UPDATE user_templates SET name=?,mode=?,payload=?,approved_revision=? WHERE user_id=? AND template_id=?',
+                                  (proposed['name'],proposed['mode'],proposed['payload'],revision,uid,tid))
+                self.conn.execute('DELETE FROM template_reviews WHERE revision=?',(revision,))
+            else:
+                self.conn.execute("UPDATE template_reviews SET state='rejected' WHERE revision=?",(revision,))
+            self.log(actor,'template_approved' if approve else 'template_rejected',f'{uid}:{tid}')
+            return proposed
+
     def templates(self,uid:int):
         owner_id=getattr(self,'owner_id',0)
         if owner_id and owner_id!=uid:
             rows=self.conn.execute(
-                '''SELECT template_id,name,mode,user_id,is_shared FROM user_templates
-                   WHERE user_id=? OR (user_id=? AND is_shared=1)
+                '''SELECT template_id,name,mode,user_id,is_shared,approved_revision FROM user_templates
+                   WHERE user_id=? OR (user_id=? AND is_shared=1 AND approved_revision IS NOT NULL)
                    ORDER BY (user_id=?) DESC, created_at DESC, rowid DESC''',
                 (uid,owner_id,uid))
         else:
             rows=self.conn.execute(
-                'SELECT template_id,name,mode,user_id,is_shared FROM user_templates WHERE user_id=? ORDER BY created_at DESC,rowid DESC',
+                'SELECT template_id,name,mode,user_id,is_shared,approved_revision FROM user_templates WHERE user_id=? ORDER BY created_at DESC,rowid DESC',
                 (uid,))
         return [{**dict(r),'owned':r['user_id']==uid,'is_shared':bool(r['is_shared'])} for r in rows]
 
@@ -204,7 +266,7 @@ class ExtendedStore(Store):
             row=self.conn.execute('SELECT * FROM user_templates WHERE user_id=? AND template_id=?',(uid,template_id)).fetchone()
         else:
             row=self.conn.execute(
-                '''SELECT * FROM user_templates WHERE template_id=? AND (user_id=? OR (user_id=? AND is_shared=1))
+                '''SELECT * FROM user_templates WHERE template_id=? AND (user_id=? OR (user_id=? AND is_shared=1 AND approved_revision IS NOT NULL))
                    ORDER BY (user_id=?) DESC LIMIT 1''',
                 (template_id,uid,owner_id,uid)).fetchone()
         return {**dict(row),'owned':row['user_id']==uid,'is_shared':bool(row['is_shared'])} if row else None
@@ -215,8 +277,10 @@ class ExtendedStore(Store):
         return r.rowcount>0
 
     def delete_template(self,uid:int,template_id:str)->bool:
-        r=self.conn.execute('DELETE FROM user_templates WHERE user_id=? AND template_id=?',(uid,template_id))
-        return r.rowcount>0
+        with self._write_transaction():
+            r=self.conn.execute('DELETE FROM user_templates WHERE user_id=? AND template_id=?',(uid,template_id))
+            self.conn.execute('DELETE FROM template_reviews WHERE user_id=? AND template_id=?',(uid,template_id))
+            return r.rowcount>0
 
     def preferences(self,uid:int)->dict:
         row=self.conn.execute('SELECT settings_json FROM user_preferences WHERE user_id=?',(uid,)).fetchone()

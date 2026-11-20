@@ -19,7 +19,7 @@ def test_pool_stays_reserved_until_the_provider_confirms_finish():
             first=db.queue_task(7,'Первый','publish',{'assets':{'accountIds':['a']}})
             second=db.queue_task(7,'Второй','publish',{'assets':{'accountIds':['a']}})
             api=FakeTokora()
-            worker=Worker(db,api,FakeTelegram(),Config('fake','fake',99,dispatch_enabled=True))
+            worker=Worker(db,api,FakeTelegram(),Config('fake','fake',99,dispatch_enabled=True,max_active_external=1))
             await worker.tick()
             api.final['job1']={'id':'job1','state':'running','stopRequested':True}
             await worker.tick()
@@ -28,9 +28,11 @@ def test_pool_stays_reserved_until_the_provider_confirms_finish():
             await worker.tick()
             assert db.task(first)['state']=='stopping'
             assert db.task(second)['state']=='queued' and len(api.started)==1
+            assert db.account_in_use('a')
             api.final['job1']['finishedAt']=FINISHED_AT
             await worker.refresh()
             assert db.task(first)['state']=='stopped'
+            assert not db.account_in_use('a')
             assert db.next_eligible(99)['task_id']==second
     asyncio.run(run())
 
@@ -64,7 +66,7 @@ def test_import_does_not_take_a_slot_and_conflicts_have_distinct_outcomes(code,s
             assert len(api.started)==1
             saved=db.task(task)
             assert saved['state']==state
-            assert saved['error_code']==('job_duplicate' if state=='failed' else '')
+            assert saved['error_code']==code
             assert not saved['upstream_id']
     asyncio.run(run())
 

@@ -70,7 +70,7 @@ class LiveCards:
         return await self.open_check(uid, 'pool', view, job['state']=='running', job['check_id'])
 
     async def open_account_import(self,uid:int,job:dict):
-        view = self.app.account_imports.render(job)
+        view = self.app.account_imports.render(uid,job)
         return await self.open_check(uid, 'import', view, job['state']=='running', job['import_id'])
 
     async def open_workspace_task(self,uid:int,task:dict):
@@ -150,11 +150,11 @@ class LiveCards:
                 view = self.app.pool_checks.render(uid,job)
                 keep = job['state'] == 'running'
             elif card.kind == 'import':
-                job = self.app.db.account_import(uid,import_id=card.task_id) if is_admin else None
+                job = self.app.account_imports.get_job(uid,import_id=card.task_id)
                 if not job:
                     self.cards.pop(uid,None)
                     return
-                view = self.app.account_imports.render(job)
+                view = self.app.account_imports.render(uid,job)
                 keep = job['state'] == 'running'
             else:
                 task = self.app.db.task(card.task_id, None if is_admin else uid)

@@ -89,7 +89,7 @@ def test_late_poll_does_not_replace_a_newer_snapshot(response):
     asyncio.run(run())
 
 
-def test_two_slots_skip_an_overlapping_order_and_count_remote_and_local_only_once():
+def test_two_slots_share_a_users_pool_and_count_remote_and_local_only_once():
     class Provider(FakeTokora):
         async def start(self, payload):
             self.started.append(payload)
@@ -109,26 +109,32 @@ def test_two_slots_skip_an_overlapping_order_and_count_remote_and_local_only_onc
             cfg = Config('fake', 'fake', 99, dispatch_enabled=True, max_active_external=2)
             worker = Worker(db, api, FakeTelegram(), cfg)
             await worker.tick()
-            assert not db.claim_start(overlap, 'queued', 99, max_active=2)
             api.active = [{'id': 'job-1', 'state': 'running'}]
             await worker.tick()
             await worker.tick()
-            assert [payload['assets']['accountIds'] for payload in api.started] == [['a'], ['b']]
-            assert db.task(first)['state'] == db.task(second)['state'] == 'running'
-            assert db.task(overlap)['state'] == db.task(third)['state'] == 'queued'
+            assert [payload['assets']['accountIds'] for payload in api.started] == [['a'], ['a']]
+            assert db.task(first)['state'] == db.task(overlap)['state'] == 'running'
+            assert db.task(second)['state'] == db.task(third)['state'] == 'queued'
             assert not db.claim_start(third, 'queued', 99, max_active=2)
             api.final['job-1'] = {'id': 'job-1', 'state': 'completed','finishedAt':FINISHED_AT}
             api.active = [{'id': 'job-2', 'state': 'running'}]
             await worker.tick()
             assert db.task(first)['state'] == 'completed'
-            assert db.task(overlap)['state'] == 'running'
+            assert db.task(second)['state'] == 'running'
             assert db.task(third)['state'] == 'queued'
         finally:
             db.close()
     asyncio.run(run())
 
 
-def test_website_job_with_obsolete_account_ids_keeps_queue_waiting():
+def test_members_can_fill_shared_slots_with_their_own_pools_alongside_site_tasks():
+    class Provider(FakeTokora):
+        async def start(self,payload):
+            self.started.append(payload)
+            job={'id':f'job-{len(self.started)}','state':'running'}
+            self.active.append(job)
+            return job
+
     async def run():
         db = Store(':memory:')
         try:
@@ -136,22 +142,35 @@ def test_website_job_with_obsolete_account_ids_keeps_queue_waiting():
             db.assign(7, 'a')
             db.grant(8, 30)
             db.assign(8, 'b')
-            first = db.queue_task(7, 'Первый', 'fetch', {'assets': {'accountIds': ['a']}})
-            second = db.queue_task(8, 'Второй', 'fetch', {'assets': {'accountIds': ['b']}})
-            api = FakeTokora()
+            cfg=Config('fake','fake',99,dispatch_enabled=True)
+            with pytest.raises(ValueError,match='Назначенные аккаунты'):
+                db.queue_task(7,'Чужой пул','fetch',{'assets':{'accountIds':['b']}})
+            orders=[db.queue_task(7,f'Заказ {n}','fetch',{'assets':{'accountIds':['a']}},
+                                  max_open=cfg.max_open_tasks) for n in range(5)]
+            with pytest.raises(ValueError,match='количество одновременно'):
+                db.queue_task(7,'Шестой','fetch',{'assets':{'accountIds':['a']}},max_open=cfg.max_open_tasks)
+            other=db.queue_task(8,'Другой трафер','fetch',{'assets':{'accountIds':['b']}})
+            api=Provider()
             api.active = [{'id': 'website', 'state': 'running', 'accountsAssigned': 1}]
-            worker = Worker(db, api, FakeTelegram(), Config('fake', 'fake', 99, dispatch_enabled=True))
+            worker=Worker(db,api,FakeTelegram(),cfg)
+            for _ in range(6):
+                await worker.tick()
+            assert [db.task(tid)['state'] for tid in orders]==['running']*4+['queued']
+            assert db.task(other)['state']=='queued'
+            assert len(api.active)==5
+
+            api.active=[job for job in api.active if job['id']!='website']
             await worker.tick()
-            assert db.task(first)['error_code'] == 'external_pool_unknown'
-            assert api.started == []
-            api.active[0]['assets'] = {'accountIds': ['a']}
+            assert all(db.task(tid)['state']=='running' for tid in orders)
+            assert db.task(other)['state']=='queued'
+            assert [payload['assets']['accountIds'] for payload in api.started]==[['a']]*5
+
+            api.final['job-1']={'id':'job-1','state':'completed','finishedAt':FINISHED_AT}
+            api.active=[job for job in api.active if job['id']!='job-1']
             await worker.tick()
-            assert api.started == []
-            api.active.clear()
-            await worker.tick()
-            assert [payload['assets']['accountIds'] for payload in api.started] == [['a']]
-            assert db.task(first)['state'] == 'running'
-            assert db.task(second)['state'] == 'queued'
+            assert len(db.running())==5 and db.task(other)['state']=='running'
+            assert api.started[-1]['assets']['accountIds']==['b']
+            assert db.account_in_use('a')
         finally:
             db.close()
     asyncio.run(run())
@@ -177,7 +196,7 @@ def test_configured_slot_limit_and_tokora_busy_keep_second_order_queued(limit):
             assert len(api.started) == limit
             assert db.task(first)['state'] == 'running'
             assert db.task(second)['state'] == 'queued'
-            assert not db.task(second)['error_code']
+            assert db.task(second)['error_code']==('job_busy' if limit==2 else '')
             assert db.task(second)['launch_payload_json'] is None
         finally:
             db.close()
@@ -330,7 +349,7 @@ def test_invalid_tokora_key_keeps_order_queued_with_an_actionable_status():
 
 def test_worker_uncertain_retry_uses_same_request_id():
     async def run():
-        cfg=Config('fake','fake',99,dispatch_enabled=True)
+        cfg=Config('fake','fake',99,dispatch_enabled=True,max_active_external=1)
         db=Store(':memory:');db.assign(1,'acc1');db.grant(1,30)
         tid=db.queue_task(1,'Run','publish',{'assets':{'accountIds':['acc1']}})
         api=FakeTokora();tg=FakeTelegram();worker=Worker(db,api,tg,cfg)
@@ -526,8 +545,10 @@ def test_config_supports_higher_concurrency_and_restricted_modes(monkeypatch):
     monkeypatch.setenv('TOKORA_API_KEY', 'key')
     monkeypatch.setenv('OWNER_ID', '99')
     monkeypatch.delenv('MAX_ACTIVE_TASKS', raising=False)
+    monkeypatch.delenv('MAX_OPEN_TASKS', raising=False)
     monkeypatch.setenv('RESTRICTED_MODES', 'fetch, feedwarm, fetch')
     assert Config.from_env().max_active_external == 5
+    assert Config.from_env().max_open_tasks == 5
 
     monkeypatch.setenv('MAX_ACTIVE_TASKS', '4')
     cfg = Config.from_env()

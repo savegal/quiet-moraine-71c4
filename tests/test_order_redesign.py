@@ -4,7 +4,7 @@ import json
 import pytest
 
 from proxima_bot.order_form import parse_volume_message
-from test_extended import button_callback, new_app
+from test_extended import seed_approved_template, approve_template, button_callback, new_app
 from test_guided_order_form import options, click
 from test_release_flows import TelegramTransport
 
@@ -51,14 +51,15 @@ def test_template_edit_returns_to_order_without_duplicates_or_losing_input(save)
             callback = button_callback(app, 'wiz:template:')
             await app.callback(7, {'data': callback})
             assert app.db.draft(7)['mode'] == 'local_template'
-            assert app.db.templates(7) == []
+            assert len(app.db.templates(7)) == 1
             if save:
                 confirmation = button_callback(app, 'lt:save:')
                 await app.callback(7, {'data': confirmation})
                 await app.callback(7, {'data': confirmation})
-                assert len(app.db.templates(7)) == 1
+                assert len(app.db.templates(7)) == 2
                 assert app.db.draft(7)['data'] == original['data']
                 item = app.db.templates(7)[0]
+                await approve_template(app,7,item['template_id'])
                 body = json.loads(app.db.template(7, item['template_id'])['payload'])['draft']
                 assert 'videos' not in body
                 assert '_return_draft' not in body
@@ -97,7 +98,7 @@ def test_media_template_quantity_can_change_without_writing_to_provider():
 
         app.api.call = provider
         try:
-            tid = app.db.save_template(99, 'Видео', 'video_post', {'media': {'description': 'Подпись', 'per_account': 3}})
+            tid = seed_approved_template(app, 99, 'Видео', 'video_post', {'media': {'description': 'Подпись', 'per_account': 3}})
             await app.media_template_preview(99, tid, 'media')
             await app.callback(99, {'data': button_callback(app, 'mtpl:edit:')})
             assert app.db.draft(99)['mode'] == 'media_order'
@@ -117,16 +118,16 @@ def test_menu_uses_auto_name_and_new_template_opens_compact_editor():
         app = new_app()
         try:
             await app.callback(7, {'data': 'new:publish'})
-            assert app.db.draft(7)['step'] == 'videos'
+            assert app.db.draft(7)['step'] == 'choose_template'
             assert app.db.draft(7)['data']['name'].startswith('Комментарии и ответы')
             await app.callback(7, {'data': 'tpl_new:publish'})
             await app.input_draft(7, 'Мой шаблон')
             assert app.db.draft(7)['step'] == 'review'
             await click(app, 'lt:edit_replies:')
             await click(app, 'lt:off:')
-            assert 'Не использовать' in app.tg.out[-1][1]
+            assert 'Нет текстов' in app.tg.out[-1][1]
             await click(app, 'lt:cancel:')
-            assert app.db.draft(7)['step'] == 'videos'
+            assert app.db.draft(7)['step'] == 'choose_template'
         finally:
             app.db.close()
     asyncio.run(run())

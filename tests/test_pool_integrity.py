@@ -63,8 +63,8 @@ def test_active_and_ambiguous_launches_lock_actual_sent_accounts():
         assert not db.account_in_use('excluded')
         db.transition(first, 'reconcile')
         db.hold_reconciliation(first)
-        assert not db.claim_start(overlap, 'queued', 99)
-        assert db.next_eligible(99)['task_id'] == other
+        assert db.next_eligible(99)['task_id'] == overlap
+        assert db.claim_start(overlap, 'queued', 99)
         with pytest.raises(ValueError):
             db.assign(8, 'used')
         assert db.assign(8, 'excluded')

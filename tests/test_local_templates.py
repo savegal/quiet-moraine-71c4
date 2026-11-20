@@ -6,7 +6,7 @@ import pytest
 from proxima_bot.order_templates import MEDIA_TEMPLATE_MODES, TEMPLATE_LABELS, template_fields
 from proxima_bot.operations import load_spec
 from test_api_coverage import sample
-from test_extended import button_callback, new_app, collected_cid
+from test_extended import seed_approved_template, approve_template, button_callback, new_app, collected_cid
 from test_order_flows import OrderProvider, VIDEO, COMMENT
 
 
@@ -41,7 +41,7 @@ async def create_template(app,uid,mode):
     await app.callback(uid,{'data':confirm})
     await app.callback(uid,{'data':confirm})
     item,=app.db.templates(uid)
-    return app.db.template(uid,item['template_id'])
+    return await approve_template(app,uid,item['template_id'])
 
 
 @pytest.mark.parametrize('mode',list(TEMPLATE_LABELS))
@@ -111,11 +111,12 @@ def test_template_edit_updates_existing_record_and_rename_preserves_materials():
             await app.input_draft(7,'1000')
             await click(app,7,'lt:save:')
             assert len(app.db.templates(7))==1
+            await approve_template(app,7,tid)
             assert json.loads(app.db.template(7,tid)['payload'])['draft']['fetch_count']==1000
 
             await app.callback(7,{'data':'tpl_rename:'+tid})
             await app.input_draft(7,'Мой сбор')
-            updated=app.db.template(7,tid)
+            updated=await approve_template(app,7,tid)
             assert updated['name']=='Мой сбор'
             assert json.loads(updated['payload'])['draft']['fetch_count']==1000
 
@@ -123,7 +124,7 @@ def test_template_edit_updates_existing_record_and_rename_preserves_materials():
             await click(app,7,'lt:edit_fetch_count:')
             await click(app,7,'lt:skip:')
             await click(app,7,'lt:save:')
-            body=json.loads(app.db.template(7,tid)['payload'])['draft']
+            body=json.loads((await approve_template(app,7,tid))['payload'])['draft']
             assert 'fetch_count' not in body and 'fetchCount' not in body['options']
             await app.callback(8,{'data':'tpl_edit:'+tid})
             assert app.db.draft(8) is None
@@ -133,19 +134,18 @@ def test_template_edit_updates_existing_record_and_rename_preserves_materials():
     asyncio.run(run())
 
 
-def test_deferred_comment_input_keeps_saved_replies_and_allows_skip_for_reply_only_order():
+def test_approved_reply_only_template_skips_main_comment_input():
     async def run():
         app=new_app()
         try:
             item=await create_template(app,7,'publish')
             await app.callback(7,{'data':'tpl_edit:'+item['template_id']})
             await click(app,7,'lt:edit_comments:')
-            await click(app,7,'lt:skip:')
+            await click(app,7,'lt:off:')
             await click(app,7,'lt:save:')
+            await approve_template(app,7,item['template_id'])
             await app.from_template(7,item['template_id'])
             await app.input_draft(7,VIDEO)
-            assert app.db.draft(7)['step']=='comments'
-            await click(app,7,'wiz:skip:')
             assert app.db.draft(7)['step']=='options'
             await click(app,7,'wiz:quick:')
             assert app.db.draft(7)['step']=='review'
@@ -166,12 +166,13 @@ def test_edit_at_template_limit_and_source_reply_template_use_do_not_create_dupl
         try:
             item=await create_template(app,7,'source_reply')
             for index in range(49):
-                app.db.save_template(7,f'Шаблон {index}','fetch',{})
+                seed_approved_template(app, 7,f'Шаблон {index}','fetch',{})
             await app.callback(7,{'data':'tpl_edit:'+item['template_id']})
             await click(app,7,'lt:edit_replies:')
             await app.input_draft(7,'Обновлённый ответ')
             await click(app,7,'lt:save:')
             assert len(app.db.templates(7))==50
+            await approve_template(app,7,item['template_id'])
             source=app.db.queue_task(7,'Сбор','fetch',{'assets':{'accountIds':['acc7']}})
             app.db.transition(source,'completed',upstream_id='collected')
             await app.from_template(7,item['template_id'])
@@ -194,12 +195,13 @@ def test_editing_legacy_reply_link_template_preserves_order_type():
     async def run():
         app=new_app()
         try:
-            tid=app.db.save_template(7,'Ответы','publish',{'job':{
+            tid=seed_approved_template(app, 7,'Ответы','publish',{'job':{
                 'kind':'publish','replyLinks':[COMMENT],'assets':{'replyTexts':['Ответ']},
             }})
             await app.callback(7,{'data':'tpl_edit:'+tid})
             assert app.db.draft(7)['data']['mode']=='reply_links'
             await click(app,7,'lt:save:')
+            await approve_template(app,7,tid)
             assert app.db.template(7,tid)['mode']=='reply_links'
             await app.from_template(7,tid)
             await app.input_draft(7,COMMENT)

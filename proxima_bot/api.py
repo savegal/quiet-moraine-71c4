@@ -185,10 +185,14 @@ async def scan_active_tasks(api, *, first_only:bool=False, retries:int=1) -> lis
 
 
 class ApiError(Exception):
-    def __init__(self, code:str, status:int=0, retry_after:float=0, *, request_id:str='', rate_scope:str=''):
+    def __init__(self, code:str, status:int=0, retry_after:float=0, *, request_id:str='', rate_scope:str='',
+                 provider_message:str='', required_scope:str='', from_provider:bool=False):
         self.code,self.status,self.retry_after=code,status,retry_after
         self.request_id = request_id
         self.rate_scope = rate_scope
+        self.provider_message = provider_message
+        self.required_scope = required_scope
+        self.from_provider = from_provider
         super().__init__(f'Upstream {code} ({status})')
 
 
@@ -228,21 +232,29 @@ class Tokora:
                 await asyncio.sleep(wait)
 
     def response_error(self, response: aiohttp.ClientResponse, body, fallback: str) -> ApiError:
-        error = body.get('error') if isinstance(body, dict) else None
+        body = body if isinstance(body,dict) else {}
+        error = body.get('error')
         error = error if isinstance(error, dict) else {}
-        candidate_code=error.get('code') or (body.get('code') if isinstance(body,dict) else None)
-        if not candidate_code and isinstance(body,dict) and isinstance(body.get('error'),str):candidate_code=body['error']
-        code=candidate_code if isinstance(candidate_code,str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,100}',candidate_code) else fallback
+        candidate_code=error.get('code') or body.get('code') or body.get('error')
+        code=candidate_code if (isinstance(candidate_code,str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,100}',candidate_code)
+                                and not (self.key and self.key in candidate_code)) else fallback
+        message=error.get('message') or body.get('message')
+        if not isinstance(message,str):
+            message=candidate_code if isinstance(candidate_code,str) and candidate_code!=code else ''
+        if self.key:message=message.replace(self.key,'[ключ скрыт]')
+        scope=body.get('scope') or error.get('scope')
+        scope=scope if isinstance(scope,str) and re.fullmatch(r'[a-z0-9_]{1,32}:[a-z0-9_]{1,32}',scope) else ''
         request_id = ''
-        for candidate in (error.get('requestId'), response.headers.get('X-Request-Id')):
-            if isinstance(candidate, str) and REQUEST_ID_PATTERN.fullmatch(candidate):
+        for candidate in (error.get('requestId'), body.get('requestId'), response.headers.get('X-Request-Id')):
+            if (isinstance(candidate,str) and REQUEST_ID_PATTERN.fullmatch(candidate)
+                    and not (self.key and self.key in candidate)):
                 request_id = candidate
                 self.last_error_request_id = request_id
                 log.warning('Tokora HTTP %d, request_id=%s', response.status, request_id)
                 break
         retry_after = response.headers.get('Retry-After', '')
         delay = max(1, float(retry_after)) if re.fullmatch(r'[0-9]{1,8}(?:\.[0-9]{1,3})?', retry_after) else 3.0
-        rate_scope = body.get('limit') if isinstance(body, dict) else None
+        rate_scope = body.get('limit')
         if rate_scope not in ('key', 'account', 'ip'):
             rate_scope = error.get('limit')
         rate_scope = rate_scope if rate_scope in ('key', 'account', 'ip') else ''
@@ -253,7 +265,8 @@ class Tokora:
                 self._rate_limit_request_id = request_id
                 self.rate_limit_scope = rate_scope
         return ApiError(code, response.status, delay, request_id=request_id,
-                        rate_scope=rate_scope)
+                        rate_scope=rate_scope, provider_message=message[:4000],required_scope=scope,
+                        from_provider=True)
 
     async def call(self, method:str, path:str, *, payload:dict|None=None, params:dict|None=None,
                    retries:int|None=None, background:bool=False) -> dict:

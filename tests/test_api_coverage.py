@@ -150,6 +150,30 @@ def test_api_console_validates_path_query_and_keeps_binary_local():
     asyncio.run(run())
 
 
+def test_proxima_diagnostics_redact_system_references_links_and_credentials():
+    async def run():
+        app=new_app()
+        try:
+            async def api_call(method,path,**kwargs):
+                assert (method,path)==('GET','/v1/statistics')
+                return {'tokoraLines':2,'detail':'Токоры https://api.tokora.online/v1/tasks @Tokora_TikTok_Bot',
+                        'ref':'tk_example_diagnostic_key','url':'https://private.example/internal','status':'ready'}
+
+            app.api.call=api_call
+            await app.command(99,'/api getStatistics')
+            diagnostic=app.tg.out[-1][1]
+            plan=app.render_post_plan({'id':'plan1','state':'failed',
+                                       'error':'Проверь https://t.me/Tokora_TikTok_Bot и https://tokora.online/app'})
+            for output in (diagnostic,*plan[:2]):
+                assert not any(ref in output.casefold() for ref in ('tokora','токор','/v1/tasks','t.me/'))
+            assert 'poolLines' in diagnostic and 'ready' in diagnostic
+            assert 'tk_example_diagnostic_key' not in diagnostic and 'private.example' not in diagnostic
+        finally:
+            app.db.close()
+
+    asyncio.run(run())
+
+
 def test_rich_card_downgrades_and_keeps_updating():
     async def run():
         app = new_app()
@@ -229,7 +253,7 @@ def test_health_distinguishes_missing_scope_and_invalid_key():
         app.api.call = read
         await app.health(99)
         text = app.tg.out[-1][1]
-        assert 'posts:read' in text and 'Нет права' in text and 'Отключена' in text
+        assert 'Диагностика Proxima' in text and 'posts:read' in text and 'Нет права' in text and 'Отключена' in text
         assert len(requested) == 5
 
         async def invalid_key():
@@ -237,7 +261,7 @@ def test_health_distinguishes_missing_scope_and_invalid_key():
 
         app.api.active_tasks = invalid_key
         await app.health(99)
-        assert 'отклонил ключ' in app.tg.out[-1][1]
+        assert 'Ключ доступа отклонён' in app.tg.out[-1][1]
         assert len(requested) == 5
         app.db.close()
 

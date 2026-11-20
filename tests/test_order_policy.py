@@ -11,7 +11,7 @@ from proxima_bot.db import Store
 from proxima_bot.extended import ProximaApp
 from proxima_bot.order_form import field_presets, order_fields
 from proxima_bot.worker import Worker
-from test_extended import new_app, button_callback, collected_entry, collected_cid, FakeTG, FakeAPI
+from test_extended import seed_approved_template, approve_template, new_app, button_callback, collected_entry, collected_cid, FakeTG, FakeAPI
 from test_guided_order_form import options, click
 from test_order_flows import VIDEO, COMMENT
 from test_worker import FakeTokora, FakeTelegram
@@ -61,6 +61,7 @@ def test_mode_access_gates_old_order_and_followup_confirmations():
                 return {'available': True, 'all': 1, 'repliesPerComment': 1}
 
             app.api.call = reply_topup
+            seed_approved_template(app, 7,'Ответы','reply_links',{'draft':{'replies':['Ответ']}})
             await app.callback(7, {'data': 'replyinfo:' + publication})
             submit = button_callback(app, 'topup:')
             app.set_mode_restricted('reply_links', True)
@@ -86,13 +87,14 @@ def test_reply_link_order_can_be_repeated_and_saved_when_regular_publish_is_rest
             await app.task(7,task)
             await click(app,'repeat:')
             assert app.db.draft(7)['mode']=='reply_links'
-            assert app.db.draft(7)['step']=='reply_links'
+            assert app.db.draft(7)['step']=='choose_template'
             await app.task(7,task)
             await click(app,'template_task:')
             assert app.db.draft(7)['data']['mode']=='reply_links'
             await click(app,'lt:save:')
             template,=app.db.templates(7)
             assert template['mode']=='reply_links'
+            await approve_template(app,7,template['template_id'])
             await app.from_template(7,template['template_id'])
             assert app.db.draft(7)['mode']=='reply_links'
             assert app.db.draft(7)['step']=='reply_links'
@@ -107,7 +109,7 @@ def test_restricted_reply_link_order_cannot_reopen_from_a_legacy_publish_templat
         app.cfg=replace(app.cfg,restricted_modes=('reply_links',))
         try:
             payload={'kind':'publish','assets':{'replyTexts':['Ответ']},'replyLinks':[COMMENT]}
-            template=app.db.save_template(7,'Ответы','publish',{'job':payload})
+            template=seed_approved_template(app, 7,'Ответы','publish',{'job':payload})
             await app.from_template(7,template)
             assert app.db.draft(7) is None
             assert 'доступен только владельцу' in app.tg.out[-1][1]
@@ -170,7 +172,7 @@ def test_fresh_targets_are_required_and_never_saved_as_preferences():
         app = new_app()
         try:
             app.db.set_preferences(7, {'last_videos': [VIDEO]})
-            tid = app.db.save_template(7, 'Старый', 'publish', {'draft': {
+            tid = seed_approved_template(app, 7, 'Старый', 'publish', {'draft': {
                 'videos': [VIDEO], 'comments': ['Текст'], 'replies': [],
             }})
             await app.from_template(7, tid)
@@ -216,7 +218,7 @@ def test_selected_collected_comment_ids_and_reply_template_preview():
         try:
             source = app.db.queue_task(7, 'Сбор', 'fetch', {'assets': {'accountIds': ['acc7']}})
             app.db.transition(source, 'completed', upstream_id='source')
-            app.db.save_template(7, 'Ответы', 'publish', {'draft': {'replies': ['Ответ из шаблона']}})
+            seed_approved_template(app, 7, 'Ответы', 'publish', {'draft': {'replies': ['Ответ из шаблона']}})
             await app.callback(7, {'data': 'source_reply:' + source})
             await app.input_draft(7, '2')
             await click(app, 'source:tpl_')
@@ -256,7 +258,7 @@ def test_timeout_survives_worker_restart_and_waits_for_stop_confirmation(monkeyp
             db.grant(7, 30); db.assign(7, 'a')
             first = db.queue_task(7, 'Первый', 'publish', {'assets': {'accountIds': ['a']}})
             db.queue_task(7, 'Второй', 'publish', {'assets': {'accountIds': ['a']}})
-            api = Provider(); cfg = Config('fake', 'fake', 99, dispatch_enabled=True)
+            api = Provider(); cfg = Config('fake', 'fake', 99, dispatch_enabled=True, max_active_external=1)
             worker = Worker(db, api, FakeTelegram(), cfg)
             await worker.tick()
             assert db.task(first)['execution_started_at'] == clock[0]
@@ -288,7 +290,7 @@ def test_import_owner_access_does_not_leak_to_other_members_or_follow_reassignme
         db.close()
 
 
-def test_busy_executor_keeps_order_queued_without_error():
+def test_busy_executor_keeps_order_queued_with_retry_reason():
     async def run():
         db=Store(':memory:')
         try:
@@ -300,8 +302,9 @@ def test_busy_executor_keeps_order_queued_without_error():
             api.start=busy
             await Worker(db,api,FakeTelegram(),Config('fake','fake',99,dispatch_enabled=True)).tick()
             assert db.task(tid)['state']=='queued'
-            assert db.task(tid)['error_code']==''
-            assert 'Заказ поставлен в очередь' in task_rich(db.task(tid))
+            assert db.task(tid)['error_code']=='job_busy'
+            card=task_rich(db.task(tid))
+            assert 'Заказ поставлен в очередь' in card and 'Сервис занят' in card
         finally:db.close()
     asyncio.run(run())
 

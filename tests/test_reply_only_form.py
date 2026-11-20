@@ -4,7 +4,7 @@ import json
 import pytest
 
 from proxima_bot.order_form import complete_order_form, edit_order_form, order_fields
-from test_extended import new_app, collected_entry, collected_cid
+from test_extended import new_app, collected_entry, collected_cid, select_order_template
 from test_guided_order_form import click
 from test_release_flows import TelegramTransport
 
@@ -70,7 +70,7 @@ def test_collected_replies_keep_count_once_and_sanitize_legacy_draft_at_submissi
             app.db.transition(source, 'completed', upstream_id='source')
             await app.callback(7, {'data': 'source_reply:' + source})
             await app.input_draft(7, '2')
-            await app.input_draft(7, 'Ответ')
+            await select_order_template(app,7,'source_reply',replies=['Ответ'])
             draft = app.db.draft(7)
             assert 'targetCount' not in draft['data']['options']
             # Old inline buttons cannot add the removed settings back.

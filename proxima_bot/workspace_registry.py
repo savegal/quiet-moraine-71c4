@@ -12,7 +12,14 @@ from cryptography.fernet import Fernet, InvalidToken
 
 PRIMARY_WORKSPACE = 'main'
 WORKSPACE_ID = re.compile(r'main|[a-f0-9]{12}')
-KEY_COMMAND = '/tokora_key'
+KEY_COMMAND = '/cabinet_key'
+CREATE_COMMAND = '/cabinet_create'
+MEMBER_COMMAND = '/cabinet_member'
+LEGACY_COMMANDS = {
+    '/tokora_key': KEY_COMMAND,
+    '/tokora_workspace': CREATE_COMMAND,
+    '/tokora_member': MEMBER_COMMAND,
+}
 KEY_FORMAT = re.compile(r'tk_[A-Za-z0-9_-]{12,256}')
 
 

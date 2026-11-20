@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .accounts import ACCOUNT_FOLDER_ID
@@ -41,8 +42,10 @@ class CabinetKey(Tokora):
 
 
 class CabinetAPI(Tokora):
-    def __init__(self, session, base_url: str, timeout: int):
+    def __init__(self, session, base_url: str, timeout: int, *,
+                 report_error: Callable[[str,str,ApiError],None] | None = None):
         super().__init__(session, base_url, '', timeout)
+        self.report_error = report_error
         self.budget = CabinetBudget()
         self.clients: dict[str, CabinetKey] = {}
         self.next_key = 0
@@ -80,14 +83,20 @@ class CabinetAPI(Tokora):
                 elif exc.status == 403 and exc.code == 'api_scope_denied':
                     pass
                 elif exc.status != 429 or exc.rate_scope != 'key':
+                    self.report_failed_request(operation,args,exc)
                     raise
                 errors.append(exc)
         if errors:
             throttled = [error for error in errors if error.status == 429]
-            if throttled:
-                raise min(throttled, key=lambda error: error.retry_after)
-            raise errors[-1]
+            error = min(throttled,key=lambda error:error.retry_after) if throttled else errors[-1]
+            self.report_failed_request(operation,args,error)
+            raise error
         raise ApiError('api_key_invalid', 401)
+
+    def report_failed_request(self, operation: str, args: tuple, error: ApiError) -> None:
+        if not self.report_error:return
+        method,path = args[:2] if operation=='call' else ('POST' if operation=='upload' else 'GET',args[0])
+        self.report_error(method,path,error)
 
     async def call(self, method: str, path: str, **kwargs) -> dict:
         return await self._request('call', method, path, **kwargs)

@@ -3,7 +3,8 @@ import json
 
 import pytest
 
-from test_extended import button_callback, new_app
+from test_extended import approved_order_data, button_callback, new_app
+from test_guided_order_form import options
 from test_order_flows import OrderProvider, SCENARIOS
 from proxima_bot.catalog import resolve_payload_targets
 
@@ -13,10 +14,10 @@ def test_member_confirms_only_the_account_pool_shown_in_review(change):
     async def run():
         app = new_app()
         try:
-            app.save_wizard_step(7, 'publish', 'review', {
+            app.save_wizard_step(7, 'publish', 'review', approved_order_data(app,7,'publish',{
                 'name': 'Проверка состава', 'videos': ['7420000000000000000'],
                 'comments': ['Комментарий'], 'replies': [],
-            })
+            }))
             await app.show_wizard(7)
             confirmation = button_callback(app, 'wiz:submit:')
             if change == 'replace':
@@ -43,14 +44,8 @@ def test_order_review_keeps_targets_and_quantity_when_editing_extra_options(mode
         app = new_app()
         app.api = OrderProvider()
         try:
-            await app.begin(7, mode)
-            await app.input_draft(7, 'Правка настроек')
-            inputs, expected = SCENARIOS[mode]
-            for value in inputs:
-                await app.input_draft(7, value)
-            if mode == 'fetch':
-                await app.callback(7, {'data': button_callback(app, 'wiz:fetch_without_replies:')})
-                await app.callback(7, {'data': button_callback(app, 'wiz:skip:')})
+            await options(app,mode)
+            _, expected = SCENARIOS[mode]
             await app.callback(7, {'data': button_callback(app, 'wiz:quick:')})
             draft_before = app.db.draft(7)['data']
             await app.callback(7, {'data': button_callback(app, 'wiz:edit_options:')})

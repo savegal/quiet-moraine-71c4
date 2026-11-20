@@ -4,7 +4,7 @@ import pytest
 
 from proxima_bot.order_templates import template_input_steps
 from test_edit_in_place import Recorder
-from test_extended import button_callback, new_app
+from test_extended import approve_template, button_callback, new_app, seed_approved_template, select_order_template
 from test_guided_order_form import click, number, options
 from test_order_flows import SCENARIOS
 
@@ -39,7 +39,7 @@ def test_real_callback_renders_first_material_once_without_name_prompt(mode):
             assert app.db.draft(7)['step'] not in ('name', 'review')
             back = next(button['callback_data']
                         for row in renders[0][1]['reply_markup']['inline_keyboard']
-                        for button in row if button['callback_data'].startswith('wiz:back:'))
+                        for button in row if button['callback_data'].startswith('wiz:back:') or button['callback_data']=='create')
             await app.handle({'callback_query': {
                 'id': 'back', 'from': {'id': 7}, 'data': back,
                 'message': {'message_id': 901, 'chat': {'id': 7, 'type': 'private'}},
@@ -121,7 +121,7 @@ def test_template_rejects_disabling_both_publication_materials():
             await click(app, 'lt:save:')
             assert app.db.templates(7) == []
             assert app.db.draft(7)['step'] == 'review'
-            assert 'Нельзя выключить' in app.tg.out[-1][1]
+            assert 'Добавь хотя бы один текст' in app.tg.out[-1][1]
         finally:
             app.db.close()
     asyncio.run(run())
@@ -155,7 +155,7 @@ def test_source_named_volume_input_does_not_skip_confirmation():
             app.db.transition(tid, 'completed', upstream_id='source')
             await app.callback(7, {'data': 'source_reply:' + tid})
             await app.input_draft(7,'100')
-            await app.input_draft(7, 'Текст ответа')
+            await select_order_template(app,7,'source_reply',replies=['Текст ответа'])
             await app.input_draft(7, 'Ответы: 3\nЛайки ответам: 20')
             assert app.db.draft(7)['step'] == 'options'
             assert app.db.draft(7)['data']['options']['repliesPerComment'] == 3
@@ -164,24 +164,26 @@ def test_source_named_volume_input_does_not_skip_confirmation():
     asyncio.run(run())
 
 
-def test_reenabling_material_in_order_clears_disabled_template_rule():
+def test_reenabling_material_in_template_requires_approval():
     async def run():
         app = new_app()
         try:
-            tid = app.db.save_template(7, 'Только ответы', 'publish', {'draft': {
+            tid = seed_approved_template(app, 7, 'Только ответы', 'publish', {'draft': {
                 'name': 'Только ответы', 'videos': ['7420000000000000000'],
                 'comments': [], 'replies': ['Ответ'], 'disabled_fields': ['comments'],
             }})
             await app.from_template(7, tid)
             await app.input_draft(7,'7420000000000000000')
             await click(app, 'wiz:quick:')
-            await click(app, 'wiz:edit_comments:')
+            assert 'wiz:edit_comments:' not in str(app.tg.out[-1][2])
+            await app.edit_local_template(7,'publish',tid)
+            await click(app,'lt:edit_comments:')
             await app.input_draft(7, 'Теперь нужен основной комментарий')
-            assert 'comments' not in app.db.draft(7)['data'].get('disabled_fields', [])
-            await click(app, 'wiz:template:')
             values = app.db.draft(7)['data']['values']
             assert values['comments'] == ['Теперь нужен основной комментарий']
             assert 'comments' not in values.get('disabled_fields', [])
+            await click(app,'lt:save:')
+            await approve_template(app,7,tid)
         finally:
             app.db.close()
     asyncio.run(run())

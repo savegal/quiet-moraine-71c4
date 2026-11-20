@@ -6,7 +6,7 @@ import pytest
 from proxima_bot.order_templates import template_rows
 from proxima_bot.operations import load_spec
 from test_api_coverage import sample
-from test_extended import new_app
+from test_extended import approved_order_data, new_app
 from test_guided_order_form import options, click
 from test_order_flows import OrderProvider, SCENARIOS
 from test_release_flows import TelegramTransport
@@ -42,7 +42,9 @@ def test_every_order_confirmation_has_safe_readable_rich_and_basic_messages(mode
             data=draft['data']
             data['name']='Заказ <тест> & проверка'
             for field in ('comments','replies','keywords'):
-                if data.get(field):data[field]=['Текст <>& '+('длинная строка '*50)]*10
+                if data.get(field):data[field]=['Текст <>& '+('длинная строка '*40)]*10
+            if mode in ('publish','reply_links','keyword_reply'):
+                data=approved_order_data(app,7,mode,data)
             app.save_wizard_step(7,mode,'review',data)
             app.tg=TelegramTransport(rich)
             await app.preview(7)

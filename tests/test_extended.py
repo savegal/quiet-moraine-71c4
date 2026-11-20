@@ -58,6 +58,42 @@ def button_callback(app,prefix):
                 if button['callback_data'].startswith(prefix))
 
 
+def seed_approved_template(app,uid,name,mode,payload):
+    tid=app.db.save_template(uid,name,mode,payload)
+    review=app.db.template_review(uid,tid)
+    assert app.db.decide_template_review(app.cfg.owner_id,review['revision'],True)
+    return tid
+
+
+def approved_order_data(app,uid,mode,data):
+    from proxima_bot.order_templates import template_order_values
+
+    materials={key:data[key] for key in ('comments','replies') if key in data}
+    payload=materials if mode=='source_reply' else {'draft':materials}
+    tid=seed_approved_template(app,uid,'Одобренные тексты',mode,payload)
+    return {**data,**{key:value for key,value in template_order_values(app.db.template(uid,tid),mode).items()
+                      if key!='name'}}
+
+
+async def select_order_template(app,uid,mode,**materials):
+    payload=materials if mode=='source_reply' else {'draft':materials}
+    tid=seed_approved_template(app,uid,'Одобренные тексты',mode,payload)
+    if mode=='source_reply':await app.source_reply_field(uid)
+    else:await app.order_template_picker(uid)
+    prefix='source:tpl_' if mode=='source_reply' else 'wiz:tpl_'
+    await app.callback(uid,{'data':button_callback(app,prefix+tid+':')})
+    return tid
+
+
+async def approve_template(app,author,tid):
+    review=app.db.template_review(author,tid)
+    assert review and review['state']=='pending'
+    await app.callback(app.cfg.owner_id,{'data':'tr:approve:'+review['revision']})
+    item=app.db.template(author,tid)
+    assert item['approved_revision']==review['revision']
+    return item
+
+
 def test_all_kinds_available_and_no_auto_filter():
     assert set(MODES)=={'publish','reply_links','fetch','commentlike','keyword_reply','feedwarm','usernames','check'}
     assert parse_options('{}')=={}
@@ -86,10 +122,9 @@ def test_wizard_complete_and_task_isolation():
     async def run():
         app=new_app()
         await app.begin(7,'publish')
-        await app.input_draft(7,'Новый тест')
+        await select_order_template(app,7,'publish',comments=['Скину всем в тг'])
         await app.input_draft(7,'7420000000000000000')
-        await app.input_draft(7,'Скину всем в тг')
-        for _ in range(3): # replies, options, when
+        for _ in range(2): # options, when
             await app.callback(7,{'data':button_callback(app,'wiz:skip:')})
         await app.callback(7,{'data':button_callback(app,'wiz:submit:')})
         task=app.db.recent_tasks(7)[0]
@@ -162,7 +197,7 @@ def test_template_reuse_regenerates_request_and_pool():
         app=new_app()
         original={'kind':'publish','name':'template','requestId':'old',
                   'assets':{'accountIds':['acc7'],'commentTexts':['note']},'awemeIds':['7420000000000000000']}
-        tid=app.db.save_template(7,'template','publish',{'job':original})
+        tid=seed_approved_template(app,7,'template','publish',{'job':original})
         await app.from_template(7,tid)
         await app.input_draft(7,'7420000000000000000')
         assert app.db.draft(7)['step']=='options'
@@ -195,7 +230,7 @@ def test_export_and_source_reply_local_ownership():
         app.db.transition(tid,'completed',upstream_id='upstream1')
         await app.callback(7,{'data':'source_reply:'+tid})
         await app.input_draft(7,'100')
-        await app.input_draft(7,'ответ')
+        await select_order_template(app,7,'source_reply',replies=['ответ'])
         await app.callback(7,{'data':button_callback(app,'source:skip:')})
         await app.callback(7,{'data':button_callback(app,'source:submit:')})
         row=app.db.recent_tasks(7)[0]

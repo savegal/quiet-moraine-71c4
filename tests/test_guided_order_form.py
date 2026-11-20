@@ -5,7 +5,7 @@ import pytest
 
 from proxima_bot.operations import load_spec, valid_body
 from test_api_coverage import sample
-from test_extended import button_callback, new_app, collected_cid
+from test_extended import approve_template, button_callback, new_app, collected_cid, select_order_template
 from test_order_flows import SCENARIOS, VIDEO, OrderProvider
 
 
@@ -15,8 +15,14 @@ async def click(app,prefix,uid=7):
 
 async def options(app,mode):
     await app.begin(7,mode)
-    await app.input_draft(7,'Проверка формы')
-    for value in SCENARIOS[mode][0]:await app.input_draft(7,value)
+    inputs,expected=SCENARIOS[mode]
+    if mode in ('publish','reply_links','keyword_reply'):
+        assets=expected['assets']
+        await select_order_template(app,7,mode,comments=assets.get('commentTexts',[]),replies=assets['replyTexts'])
+        inputs=inputs[:2 if mode=='keyword_reply' else 1]
+    else:
+        await app.input_draft(7,'Проверка формы')
+    for value in inputs:await app.input_draft(7,value)
     if mode=='fetch':
         await click(app,'wiz:fetch_without_replies:')
         await click(app,'wiz:skip:')
@@ -100,15 +106,15 @@ def test_invalid_publication_quantity_stays_on_the_field(bad):
     asyncio.run(run())
 
 
-def test_review_edits_targets_texts_and_quantities_without_erasing_other_values():
+def test_review_edits_targets_and_quantities_without_changing_approved_texts():
     async def run():
         app=new_app()
         try:
             await options(app,'publish')
             await number(app,'commentsPerVideo',7)
             await click(app,'wiz:quick:')
-            for field,value in [('name','Новое название'),('targets','7420000000000000001'),
-                                ('comments','Новый комментарий'),('replies','Новый ответ')]:
+            assert 'wiz:edit_comments:' not in str(app.tg.out[-1][2])
+            for field,value in [('name','Новое название'),('targets','7420000000000000001')]:
                 await click(app,'wiz:edit_'+field+':')
                 await app.input_draft(7,value)
                 assert app.db.draft(7)['step']=='review'
@@ -119,7 +125,7 @@ def test_review_edits_targets_texts_and_quantities_without_erasing_other_values(
             payload=json.loads(app.db.recent_tasks(7)[0]['payload_json'])
             assert payload['settings']['commentsPerVideo']==7 and payload['settings']['likeEnabled'] is True
             assert payload['awemeIds']==['7420000000000000001']
-            assert payload['assets']['commentTexts']==['Новый комментарий']
+            assert payload['assets']['commentTexts']==['Текст комментария']
         finally:app.db.close()
     asyncio.run(run())
 
@@ -137,6 +143,7 @@ def test_template_quantities_can_be_configured_without_json_and_reused():
             await click(app,'lt:keep:')
             await click(app,'lt:save:')
             template,=app.db.templates(7)
+            await approve_template(app,7,template['template_id'])
             assert not app.api.calls
             await app.from_template(7,template['template_id'])
             await app.input_draft(7,VIDEO)
@@ -158,7 +165,7 @@ def test_source_replies_offer_quantities_and_likes_without_json():
             app.db.transition(source,'completed',upstream_id='remote-source')
             await app.callback(7,{'data':'source_reply:'+source})
             await app.input_draft(7,'100')
-            await app.input_draft(7,'Ответ')
+            await select_order_template(app,7,'source_reply',replies=['Ответ'])
             await number(app,'repliesPerComment',3,prefix='source')
             await number(app,'likesPerReply',2,prefix='source')
             await click(app,'source:skip:')
@@ -172,15 +179,16 @@ def test_source_replies_offer_quantities_and_likes_without_json():
     asyncio.run(run())
 
 
-def test_removing_reply_texts_disables_reply_actions_and_their_likes():
+def test_selecting_main_comment_template_disables_reply_actions_and_their_likes():
     async def run():
         app=new_app()
         try:
             await options(app,'publish')
             await number(app,'likesPerReply',4)
             await click(app,'wiz:quick:')
-            await click(app,'wiz:edit_replies:')
-            await click(app,'wiz:skip:')
+            await click(app,'wiz:templates:')
+            await select_order_template(app,7,'publish',comments=['Текст комментария'])
+            await click(app,'wiz:quick:')
             await click(app,'wiz:submit:')
             payload=json.loads(app.db.recent_tasks(7)[0]['payload_json'])
             assert payload['settings']['repliesPerVideo']==0
@@ -199,6 +207,7 @@ def test_template_can_ask_for_quantities_again_at_every_launch():
             await click(app,'lt:skip:')
             await click(app,'lt:save:')
             template,=app.db.templates(7)
+            await approve_template(app,7,template['template_id'])
             await app.from_template(7,template['template_id'])
             await app.input_draft(7,VIDEO)
             assert app.db.draft(7)['step']=='options'

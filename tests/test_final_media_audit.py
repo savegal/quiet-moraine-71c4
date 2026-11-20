@@ -6,7 +6,7 @@ import pytest
 from proxima_bot.api import ApiError
 from proxima_bot.operations import load_spec
 from test_api_coverage import sample
-from test_extended import button_callback, new_app
+from test_extended import seed_approved_template, button_callback, new_app
 
 
 @pytest.mark.parametrize(('changes', 'expected'), [
@@ -104,7 +104,7 @@ def test_plan_preserves_effective_caption_and_nullable_settings(route):
                 await app.begin_media_order(99,'media')
             else:
                 description='Подпись шаблона'
-                tid=app.db.save_template(99,'Видео','video_post',{'media':{'description':description}})
+                tid=seed_approved_template(app, 99,'Видео','video_post',{'media':{'description':description}})
                 await app.media_template_preview(99,tid,'media')
                 prefix='mtpl:apply:' if route=='template_apply' else 'mtpl:edit:'
                 await app.callback(99,{'data':button_callback(app,prefix)})
@@ -137,7 +137,7 @@ def test_media_template_rechecks_album_before_writing_and_keeps_form_on_failure(
 
         app.api.call=provider
         try:
-            tid=app.db.save_template(99,'Фото','photo_post',{'media':{'description':'Новая подпись'}})
+            tid=seed_approved_template(app, 99,'Фото','photo_post',{'media':{'description':'Новая подпись'}})
             await app.media_template_preview(99,tid,'media')
             confirm=button_callback(app,'mtpl:apply:')
             draft['photos']=[]

@@ -73,7 +73,9 @@ def test_key_enrollment_through_inbox_keeps_secret_out_of_sqlite_and_checks_cabi
     async def run():
         app = make_app(path, KEY_ONE)
         try:
-            await app.handle_chat_update(message(1, 99, '/tokora_workspace Второй кабинет'))
+            await app.handle_chat_update(query(99,1,'ws:new'))
+            assert '/cabinet_create' in str(app.tg.calls[-1][1])
+            await app.handle_chat_update(message(1, 99, '/cabinet_create Второй кабинет'))
             other = app.registry.workspaces()[1]['id']
             await app.handle_chat_update(query(99, 1, 'ws:addkey:main'))
             inbox = UpdateInbox(app)
@@ -88,9 +90,11 @@ def test_key_enrollment_through_inbox_keeps_secret_out_of_sqlite_and_checks_cabi
             assert ('deleteMessage', {'chat_id': 99, 'message_id': 2}) in app.tg.calls
             assert set(app.registry.credentials('main').values()) == {KEY_ONE, KEY_TWO}
             assert not app.registry.credentials(other)
-            await app.handle_chat_update(message(4, 99, '/tokora_key ' + other + ' ' + KEY_OTHER))
+            await app.handle_chat_update(message(4, 99, '/cabinet_key ' + other + ' ' + KEY_OTHER))
             assert list(app.registry.credentials(other).values()) == [KEY_OTHER]
             assert all(KEY_TWO not in str(payload) and KEY_OTHER not in str(payload) for _, payload in app.tg.calls)
+            assert all('tokora' not in str(payload).casefold() and 'tk_…' not in str(payload)
+                       for _,payload in app.tg.calls)
             with pytest.raises(ValueError, match='относится к кабинету'):
                 await app.add_key(99, other, 'tk_test_foreign_keys_12345')
             db_secret = app.db.conn.execute('SELECT secret FROM tokora_keys WHERE workspace=?', (other,)).fetchone()[0]
@@ -134,6 +138,10 @@ def test_stale_callback_and_cross_cabinet_route_are_rejected():
             assert app.registry.selected(7, 99) == 'main'
             await app.handle_chat_update(message(2, 99, f'/tokora_member {other} 7'))
             await app.handle_chat_update(query(7, 5, f'ws:open:{other}'))
+            assert app.registry.selected(7, 99) == 'main'
+            await app.handle_chat_update(query(7, 6, 'entry:request'))
+            await app.handle_chat_update(query(99, 7, 'entry:allow:7:pending'))
+            await app.handle_chat_update(query(7, 8, f'ws:open:{other}'))
             assert app.registry.selected(7, 99) == other
             await app.handle_chat_update(query(7, old_id, 'task:aaaaaaaa'))
             assert not accessed

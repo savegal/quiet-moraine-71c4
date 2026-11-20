@@ -8,6 +8,7 @@ from proxima_bot.advanced_db import ExtendedStore
 from proxima_bot.config import Config
 from proxima_bot.extended import ProximaApp
 from proxima_bot.db import Store, now
+from test_extended import seed_approved_template
 
 class TG:
     def __init__(self):self.sent=[];self.files=[]
@@ -111,6 +112,27 @@ def test_subscription_rejects_an_id_outside_sqlite_range():
         await app.input_draft(99,'12345678')
         assert app.db.draft(99)['data']['target']==12345678
         app.db.close()
+    run(f())
+
+
+def test_owner_audit_and_csv_display_proxima_execution_labels():
+    async def f():
+        app=fresh()
+        try:
+            app.db.log(99,'tokora_key_added','main')
+            await app.callback(99,{'data':'adm:audit'})
+            audit=app.tg.sent[-1][1]
+            assert 'Подключён ключ кабинета' in audit and 'tokora' not in audit.casefold()
+
+            tid=app.db.queue_task(7,'Сбор','fetch',{'assets':{'accountIds':['acc7']}})
+            app.db.transition(tid,'running',upstream_id='tokora-internal-test')
+            await app.admin_export(99,'jobs')
+            data=app.tg.files[-1][1].decode('utf-8-sig')
+            assert 'execution_id' in data and tid in data
+            assert 'tokora' not in data.casefold() and 'upstream_id' not in data
+        finally:
+            app.db.close()
+
     run(f())
 
 
@@ -407,7 +429,8 @@ def test_owner_queue_includes_paused_and_stopping_orders():
                 ids.append(tid)
             await app.callback(99,{'data':'adm:liveq:0'})
             assert {'adm:job:'+tid for tid in ids} <= callbacks(app)
-            assert '2 / 0' in app.tg.sent[-1][1]
+            assert 'Занято заказами бота · <b>2</b>' in app.tg.sent[-1][1]
+            assert 'Ожидают запуска · <b>0</b>' in app.tg.sent[-1][1]
             await app.callback(99,{'data':'adm:jobs:stopping:0'})
             assert 'adm:job:'+ids[1] in callbacks(app)
             assert 'adm:job:'+ids[0] not in callbacks(app)
@@ -470,7 +493,7 @@ def test_photo_toggle_shared_templates_live_queue_folder_sync_and_pool_summary()
             assert not a.allow_photos(7)
 
             # 2. Shared templates: member can read/use owner's shared template, cannot edit/delete
-            tid=a.db.save_template(99,'Общий пресет','publish',{'comments':['Привет'], 'replies':['Да']})
+            tid=seed_approved_template(a,99,'Общий пресет','publish',{'comments':['Привет'], 'replies':['Да']})
             await a.callback(99,{'data':f'tpl_share:{tid}'})
             assert a.db.template(99,tid)['is_shared']
             assert any(t['template_id']==tid for t in a.db.templates(7))

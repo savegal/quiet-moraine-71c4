@@ -103,10 +103,10 @@ def test_owner_views_website_tasks_and_local_queue_in_separate_tabs():
             await app.callback(99,{'data':button_callback(app,'bot_tasks:0')})
             assert 'Локальный заказ' in app.tg.out[-1][1]
             await app.callback(99,{'data':button_callback(app,'tasks')})
-            await app.callback(99,{'data':button_callback(app,'tokora_task:')})
+            await app.callback(99,{'data':button_callback(app,'cabinet_task:')})
             assert 'Все задачи' in app.tg.out[-1][1]
             assert 'tokora' not in app.tg.out[-1][1].casefold()
-            await app.callback(99,{'data':button_callback(app,'tokora_report:')})
+            await app.callback(99,{'data':button_callback(app,'cabinet_report:')})
             assert reads[-1] == ('report','cabinet-job')
             assert len(app.db.recent_tasks(99)) == 1
         finally:

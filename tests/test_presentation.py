@@ -83,6 +83,19 @@ def test_order_card_separates_confirmed_comments_and_replies_from_processed_acti
     assert 'Комментарии' in task_view(task) and '274' in task_view(task)
 
 
+@pytest.mark.parametrize(('state','upstream_state','outcome'), [
+    ('completed','completed_with_errors','Завершено с ошибками'),
+    ('failed','interrupted','Выполнение прервано'),
+])
+def test_execution_limit_and_actual_outcome_are_visible_above_metrics(state,upstream_state,outcome):
+    task={'display_name':'Публикация','task_id':'abcd1234','kind':'publish','state':state,
+          'snapshot_json':json.dumps({'state':upstream_state,'executionTimeLimit':True,
+                                      'executionLimitSeconds':1200,'done':9,'total':10})}
+    for view in (task_rich(task),task_view(task)):
+        assert view.index(outcome) < view.index('Достигнут лимит выполнения (20 минут)')
+        assert view.index('Достигнут лимит выполнения (20 минут)') < view.index('Действий обработано')
+
+
 def test_error_labels_and_cards_do_not_expose_upstream_brand():
     for mapping in (ERROR_LABELS, REPORT_REASONS):
         for code, text in mapping.items():

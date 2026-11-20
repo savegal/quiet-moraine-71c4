@@ -18,7 +18,7 @@ from .catalog import VALID_LONG_ID, VIDEO_ID, is_tiktok_url
 from .db import MAX_USER_ID, now
 from .export_parts import EXPORT_PART_BYTES, ExportParts
 from .operations import VALID_ID
-from .presentation import h, keyboard, number, pagination, rich_table, table_html
+from .presentation import h, keyboard, number, pagination, public_system_text, rich_table, table_html
 
 LIST_SIZE = 10
 COMMENT_SIZE = 6
@@ -61,7 +61,7 @@ class AccountConsoleMixin:
     def account_error_message(self,uid:int,exc:ApiError)->str:
         message = safe_api_error(exc.code)
         if self.owner(uid) and exc.request_id:
-            message += '\nID запроса · <code>'+h(exc.request_id)+'</code>'
+            message += '\nID запроса · <code>'+h(public_system_text(exc.request_id))+'</code>'
         return message
 
     def account_card_token(self,uid:int,aid:str)->str:
@@ -77,11 +77,14 @@ class AccountConsoleMixin:
             return await self.account_inventory(uid,page,status_filter or 'all')
         if not self.db.is_active(uid,self.cfg.owner_id):
             return await self.access(uid)
+        import_row=[('↑ Загрузить аккаунты','acctimp:self','success')]
+        if self.db.account_import(uid,target_id=uid):
+            import_row.append(('▤ Последний импорт',f'acctimp:last:{uid}',None))
         ids = self.db.account_ids(uid)
         if not ids:
             return await self.say(uid,
-                '<b>◇ Мои аккаунты</b>\n\nАккаунты пока не назначены. Передай владельцу свой Telegram ID.\n'
-                f'<code>{uid}</code>',keyboard([('↶ Обзор','home',None)]))
+                '<b>◇ Мои аккаунты</b>\n\nВ твоём пуле пока нет аккаунтов.',
+                keyboard(import_row,[('↶ Обзор','home',None)]))
 
         page = max(0,min(page,(len(ids)-1)//LIST_SIZE))
         visible = ids[page*LIST_SIZE:(page+1)*LIST_SIZE]
@@ -96,7 +99,7 @@ class AccountConsoleMixin:
             accounts = await self.assigned_accounts(visible)
         except ApiError as exc:
             return await self.say(uid,'<b>◇ Мои аккаунты</b>\n\n'+self.account_error_message(uid,exc),
-                                  keyboard(*rows))
+                                  keyboard(import_row,*rows))
         if not self.db.is_active(uid,self.cfg.owner_id):
             return await self.access(uid)
         if not set(visible).issubset(self.db.account_ids(uid)):
@@ -113,7 +116,7 @@ class AccountConsoleMixin:
                 cards.append([(f'{status[0]} {username}',f'ac:member:{token}',None)])
         rich,plain = table_html(f'◇ Мои аккаунты · стр. {page+1}',items,
                                 f'{number(len(ids))} в пуле. Статусы последней проверки.')
-        await self.tg.rich(uid,rich,plain,keyboard(*cards,*rows))
+        await self.tg.rich(uid,rich,plain,keyboard(import_row,*cards,*rows))
 
     async def account_inventory(self,uid:int,page:int,status:str)->None:
         if not self.owner(uid) or status not in SESSION_FILTERS:

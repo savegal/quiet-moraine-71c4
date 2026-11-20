@@ -13,7 +13,7 @@ from .accounts import ACCOUNT_STATUS,account_counts,session_state,valid_task_fol
 from .api import ApiError,Telegram,Tokora,TelegramError,lookup_accounts
 from .config import Config
 from .db import Store, local_day_start, now, task_target_links_count
-from .presentation import keyboard,home,date_from_unix,report_view,state_label,state_symbol,task_view,h,number,pagination,table_html
+from .presentation import keyboard,home,date_from_unix,report_view,state_label,state_symbol,task_view,h,number,pagination,table_html,public_system_text
 from .updates import UpdateInbox
 from .worker import snapshot_state
 
@@ -518,7 +518,8 @@ class BotApp:
             buttons.append([('↻ Доответить','replyinfo:'+task_id,None),('◇ Долайкать','likeinfo:'+task_id,None)])
         if t['state']=='queued':buttons.append([('× Отменить из очереди','cancel:'+task_id,'danger')])
         buttons.append([('↶ Мои задачи','tasks',None)])
-        await self.say(uid,task_view(t),keyboard(*buttons))
+        await self.say(uid,task_view(t,timezone_name=self.cfg.timezone_name,
+                                   queue_paused=t['state']=='queued' and not self.dispatch_active()),keyboard(*buttons))
 
     async def report(self,uid:int,task_id:str)->None:
         t=self.db.task(task_id,uid)
@@ -674,6 +675,9 @@ class BotApp:
             return 'all',total_all,max(0,int(info.get('videosAll') or 0)) or max(0,fallback_targets)
         return '',0,0
 
+    def reply_topup_template_allowed(self,uid:int,source:dict)->bool:
+        return True
+
     async def topup_info(self,uid:int,job:dict,kind:str)->None:
         if not self.db.is_active(uid,self.cfg.owner_id):return await self.access(uid)
         if kind not in TOPUP_ORDER_MODES:return
@@ -681,6 +685,9 @@ class BotApp:
             return await self.say(uid,'Этот вид заказа доступен только владельцу.')
         if not job['upstream_id'] or job['state'] not in ('completed','stopped') or job['kind']!='publish':
             return await self.say(uid,'Дополнительный запуск доступен после завершения задачи.')
+        if kind=='reply' and not self.reply_topup_template_allowed(uid,job):
+            return await self.say(uid,'Для доотправки нужен одобренный шаблон с текстами ответов из исходного заказа.',
+                                  keyboard([('▧ Мои шаблоны','templates',None)]))
         try:
             from urllib.parse import quote
             endpoint='reply-topup' if kind=='reply' else 'like-topup'
@@ -734,6 +741,9 @@ class BotApp:
                 if valid_task_folder(source_folder, allow_workspace=True):
                     payload['accountFolder'] = source_folder
             if kind=='reply':
+                if not self.reply_topup_template_allowed(uid,source):
+                    return await self.say(uid,'Для доотправки нужен одобренный шаблон с текстами ответов из исходного заказа.',
+                                          keyboard([('▧ Мои шаблоны','templates',None)]))
                 mode,comments_count,target_links=self._reply_topup_source(info,fallback_targets=base_targets)
                 if not mode:
                     return await self.say(uid,'Нет доступных комментариев для дополнительного запуска ответов.')
@@ -761,7 +771,8 @@ class BotApp:
             try:
                 task_id=self.db.queue_task(uid,label+' · '+source['display_name'][:35],job_kind,payload,
                     followup_source=source['task_id'],followup_mode=kind,max_daily=self.cfg.max_tasks_per_day,
-                    max_open=self.cfg.max_open_tasks,draft_token=token,target_count=target_links)
+                    max_open=self.cfg.max_open_tasks,draft_token=token,target_count=target_links,
+                    template_allowed=(lambda:self.reply_topup_template_allowed(uid,source)) if kind=='reply' else None)
             except sqlite3.IntegrityError:
                 return await self.say(uid,'Такое дополнительное задание уже создано. Открой «Мои задачи».')
             await self.task(uid,task_id)
@@ -773,7 +784,7 @@ class BotApp:
         stats=self.db.counts()
         await self.say(uid,'<b>▣ Панель управления</b>\n\n'+ '\n'.join(f'├ {k}: <code>{v}</code>' for k,v in stats.items())+
           '\nЗапуск заданий: <b>'+('включён' if self.dispatch_active() else 'на паузе / выключен')+'</b>\n\n'
-          '/grant ID DAYS — выдать доступ\n/revoke ID — заблокировать доступ\n/assign ID ACCOUNT_ID — назначить аккаунт\n/unassign ID ACCOUNT_ID — отвязать\n/health — состояние API\n/pool — первые 40 аккаунтов\n\n'
+          '/grant ID DAYS — выдать доступ\n/revoke ID — заблокировать доступ\n/assign ID ACCOUNT_ID — назначить аккаунт\n/unassign ID ACCOUNT_ID — отвязать\n/health — диагностика Proxima\n/pool — первые 40 аккаунтов\n\n'
           'Подписки выдаются вручную.',
           keyboard([('↶ Обзор','home',None)]))
 
@@ -791,9 +802,9 @@ class BotApp:
             tasks=await self.api.active_tasks()
             rows.append(('Задачи · tasks:read',f'✓ Доступ · активных {len(tasks)}'))
         except ApiError as exc:
-            reference = ('\nID запроса: <code>'+h(exc.request_id)+'</code>') if exc.request_id else ''
+            reference = ('\nID запроса · <code>'+h(public_system_text(exc.request_id))+'</code>') if exc.request_id else ''
             if exc.status==401 or exc.code=='api_key_invalid':
-                return await self.say(uid,'<b>! API отклонил ключ</b>\n\n'
+                return await self.say(uid,'<b>! Ключ доступа отклонён</b>\n\n'
                     'Обнови ключ доступа в настройках запуска. Затем перезапусти бота.'+reference)
             if exc.status==429:
                 return await self.say(uid,safe_api_error(exc.code)+reference)
@@ -810,8 +821,8 @@ class BotApp:
         rows.extend(await asyncio.gather(*(check_read(*item) for item in reads)))
         request_id = getattr(self.api, 'last_error_request_id', '')
         if request_id:
-            rows.append(('Последний ID ошибки API', request_id))
-        rich,plain=table_html('▣ Состояние API',rows,caption='Проверены права чтения. Запись и исполнение заказов требуют отдельного теста.')
+            rows.append(('ID последнего сбоя',public_system_text(request_id)))
+        rich,plain=table_html('▣ Диагностика Proxima',rows,caption='Проверены права чтения.')
         await self.tg.rich(uid,rich,plain,keyboard([('↶ Панель владельца','admin',None)]))
 
     async def command(self,uid:int,text:str)->bool:

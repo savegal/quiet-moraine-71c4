@@ -1,13 +1,13 @@
 import asyncio
 from datetime import datetime, timedelta
 
-from test_extended import button_callback, new_app
+from test_extended import seed_approved_template, button_callback, new_app
 from test_guided_order_form import click
 from test_order_flows import VIDEO
 
 
 def save(app, uid=7, mode='publish', **fields):
-    return app.db.save_template(uid, 'Готовые тексты', mode, {'draft': {
+    return seed_approved_template(app, uid, 'Готовые тексты', mode, {'draft': {
         'name': 'Готовые тексты', 'comments': ['Комментарий из шаблона'],
         'replies': ['Ответ из шаблона'], 'ask_fields': ['videos'], **fields,
     }})
@@ -19,8 +19,7 @@ def test_template_can_be_chosen_inside_new_order_and_volume_is_still_confirmed()
         try:
             tid = save(app, videos=['7420000000000000000'])
             await app.callback(7, {'data': 'new:publish'})
-            assert 'Выбрать шаблон' in str(app.tg.out[-1][2])
-            await click(app, 'wiz:templates:')
+            assert app.db.draft(7)['step']=='choose_template'
             await click(app, 'wiz:tpl_' + tid + ':')
             assert app.db.draft(7)['step'] == 'videos'
             await app.input_draft(7, VIDEO)
@@ -36,23 +35,17 @@ def test_template_can_be_chosen_inside_new_order_and_volume_is_still_confirmed()
     asyncio.run(run())
 
 
-def test_template_selection_after_targets_keeps_targets_and_existing_volume():
+def test_template_selection_keeps_targets_and_applies_saved_volume():
     async def run():
         app = new_app()
         try:
             tid = save(app, videos=['7420000000000000009'], options={'commentsPerVideo': 60})
-            await app.callback(7, {'data': 'new:publish'})
-            await app.input_draft(7, VIDEO)
-            draft = app.db.draft(7)
-            draft['data']['options'] = {'commentsPerVideo': 25}
-            app.save_wizard_step(7, 'publish', draft['step'], draft['data'])
-            await app.show_wizard(7)
-            await click(app, 'wiz:templates:')
+            await app.choose_order_template(7,'publish',{'name':'Повтор','videos':[VIDEO]})
             await click(app, 'wiz:tpl_' + tid + ':')
             current = app.db.draft(7)
             assert current['step'] == 'options'
             assert current['data']['videos'] == [VIDEO]
-            assert current['data']['options']['commentsPerVideo'] == 25
+            assert current['data']['options']['commentsPerVideo'] == 60
         finally:
             app.db.close()
     asyncio.run(run())
@@ -67,12 +60,11 @@ def test_picker_filters_ownership_type_and_handles_cancel_and_pagination():
             ids = [save(app) for _ in range(12)]
             await app.callback(7, {'data': 'new:publish'})
             original = app.db.draft(7)
-            await click(app, 'wiz:templates:')
             assert foreign not in str(app.tg.out[-1][2])
             assert other not in str(app.tg.out[-1][2])
             await click(app, 'wiz:tplpage_1:')
             assert ids[0] in str(app.tg.out[-1][2])
-            await click(app, 'wiz:template_back:')
+            await click(app, 'create')
             assert app.db.draft(7)['data'] == original['data']
             token = original['data']['wizard_token']
             for tid in (foreign, other):
@@ -84,13 +76,17 @@ def test_picker_filters_ownership_type_and_handles_cancel_and_pagination():
     asyncio.run(run())
 
 
-def test_no_template_adds_no_extra_required_step():
+def test_no_template_prevents_order_creation():
     async def run():
         app = new_app()
         try:
             await app.callback(7, {'data': 'new:publish'})
-            assert app.db.draft(7)['step'] == 'videos'
-            assert 'Выбрать шаблон' not in str(app.tg.out[-1][2])
+            assert app.db.draft(7)['step'] == 'choose_template'
+            await app.input_draft(7,VIDEO)
+            await app.submit(7)
+            assert app.db.draft(7)['step']=='choose_template'
+            assert not app.db.recent_tasks(7)
+            assert 'одобренный владельцем' in app.tg.out[-1][1]
         finally:
             app.db.close()
     asyncio.run(run())

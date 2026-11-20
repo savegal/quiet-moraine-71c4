@@ -7,7 +7,7 @@ from proxima_bot.api import ApiError
 from proxima_bot.catalog import resolve_payload_targets, validate_reply_links
 from proxima_bot.config import Config
 from proxima_bot.worker import Worker
-from test_extended import button_callback, collected_cid, collected_entry, collected_link, new_app
+from test_extended import approved_order_data, button_callback, collected_cid, collected_entry, collected_link, new_app, select_order_template
 from test_worker import FakeTelegram, FakeTokora
 
 
@@ -35,7 +35,7 @@ def test_collection_can_preview_and_queue_one_native_order_with_100000_roots():
             app.db.transition(source,'completed',upstream_id='collection')
             await app.callback(7,{'data':'source_reply:'+source})
             await app.input_draft(7,'100000')
-            await app.input_draft(7,'Ответ')
+            await select_order_template(app,7,'source_reply',replies=['Ответ'])
             await app.callback(7,{'data':button_callback(app,'source:skip:')})
             assert len(targets)==100_000 and targets[0]==collected_cid(1) and targets[-1]==collected_cid(100_000)
             await app.callback(7,{'data':button_callback(app,'source:submit:')})
@@ -63,8 +63,8 @@ def test_plan_rejects_removed_target_in_old_draft_before_queueing():
         try:
             source=app.db.queue_task(7,'Сбор','fetch',{'assets':{'accountIds':['acc7']}})
             app.db.transition(source,'completed',upstream_id='collection')
-            app.save_wizard_step(7,'source_reply','review',{'source_task':source,'replies':['Ответ'],
-                                  'target_links':[collected_link(2)],'target_count':1})
+            data={'source_task':source,'replies':['Ответ'],'target_links':[collected_link(2)],'target_count':1}
+            app.save_wizard_step(7,'source_reply','review',approved_order_data(app,7,'source_reply',data))
             old_token=app.db.draft(7)['data']['wizard_token']
             await app.source_reply_preview(7)
             await app.callback(7,{'data':'source:submit:'+old_token})

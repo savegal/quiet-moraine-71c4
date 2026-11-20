@@ -8,7 +8,7 @@ from proxima_bot.catalog import build_payload
 from proxima_bot.config import Config
 from proxima_bot.presentation import empty_video_search
 from proxima_bot.worker import Worker
-from test_extended import new_app
+from test_extended import seed_approved_template, approve_template, new_app
 from test_guided_order_form import click, options
 from test_order_flows import OrderProvider, VIDEO_ID
 from test_worker import FakeTelegram
@@ -51,13 +51,14 @@ def test_deferring_search_theme_in_template_keeps_filters_and_requires_new_text(
     async def run():
         app = new_app()
         try:
-            tid = app.db.save_template(7, 'Поиск', 'feedwarm', {'draft': {'warm_json': {
+            tid = seed_approved_template(app, 7, 'Поиск', 'feedwarm', {'draft': {'warm_json': {
                 'keywords': ['Старая фраза'], 'searchLimit': 75, 'periodDays': 30,
             }}})
             await app.edit_local_template(7, 'feedwarm', tid)
             await click(app, 'lt:edit_warm_json:')
             await click(app, 'lt:skip:')
             await click(app, 'lt:save:')
+            await approve_template(app,7,tid)
             await app.from_template(7, tid)
             assert app.db.draft(7)['step'] == 'warm_json'
             await app.input_draft(7, 'Новая тема')

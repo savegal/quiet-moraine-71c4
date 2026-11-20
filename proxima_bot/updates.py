@@ -45,6 +45,7 @@ class UpdateInbox:
         offset = max(update['update_id'] for update in updates)+1
         received = time.time()
         credential_command = getattr(self.app, 'credential_command', '')
+        credential_commands = getattr(self.app, 'credential_commands', (credential_command,))
         private = {}
         self.conn.execute('BEGIN IMMEDIATE')
         try:
@@ -56,7 +57,7 @@ class UpdateInbox:
                 words = text.split(maxsplit=1)
                 is_owner = credential_command and actor == self.app.cfg.owner_id
                 is_credential = credential_command and words and (
-                    words[0].split('@', 1)[0].lower() == credential_command
+                    words[0].split('@', 1)[0].lower() in credential_commands
                     or (is_owner and TOKEN_TEXT.search(text)))
                 # Keep the owner's submission in memory. The durable copy is safe to replay after a crash.
                 safe = update

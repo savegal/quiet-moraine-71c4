@@ -65,7 +65,7 @@ def test_workspace_originals_fall_back_to_ids_and_old_video_button_still_works()
             assert 'videos:remote' in str(app.render_workspace_task(card)[2])
             await app.callback(99,{'data':'videos:remote'})
             assert LINK in app.tg.out[-1][1]
-            assert 'tokora_task:remote' in str(app.tg.out[-1][2])
+            assert 'cabinet_task:remote' in str(app.tg.out[-1][2])
             await app.callback(99,{'data':'wt:videos:remote'})
             assert LINK in app.tg.out[-1][1]
         finally:

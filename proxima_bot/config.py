@@ -9,6 +9,7 @@ from .catalog import MODES
 
 
 TOKORA_TASK_SLOTS = 5
+DEFAULT_OPEN_TASKS = TOKORA_TASK_SLOTS
 
 
 def tokora_credentials() -> tuple[str, str]:
@@ -35,7 +36,7 @@ class Config:
     upstream_timeout: int = 25
     max_active_external: int = TOKORA_TASK_SLOTS
     max_tasks_per_day: int = 100
-    max_open_tasks: int = 3
+    max_open_tasks: int = DEFAULT_OPEN_TASKS
     timezone_name: str = 'Asia/Jerusalem'
     restricted_modes: tuple[str, ...] = ()
 
@@ -63,7 +64,7 @@ class Config:
             upstream_timeout=max(5,int(os.environ.get('UPSTREAM_TIMEOUT','25'))),
             max_active_external=max_active,
             max_tasks_per_day=max(0,int(os.environ.get('MAX_TASKS_PER_DAY','100'))),
-            max_open_tasks=max(0,int(os.environ.get('MAX_OPEN_TASKS','3'))),
+            max_open_tasks=max(0,int(os.environ.get('MAX_OPEN_TASKS',str(DEFAULT_OPEN_TASKS)))),
             timezone_name=timezone_name,
             restricted_modes=tuple(dict.fromkeys(raw_restricted)),
         )

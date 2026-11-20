@@ -6,7 +6,7 @@ import pytest
 from proxima_bot.api import ApiError
 from proxima_bot.db import task_target_links_count
 from proxima_bot.worker import task_execution_limit_seconds
-from test_extended import button_callback, new_app
+from test_extended import seed_approved_template, button_callback, new_app
 from test_order_flows import VIDEO
 
 
@@ -274,6 +274,7 @@ def test_reply_topup_supports_all_mode_rejects_empty_and_preserves_policy_and_ta
             )
             app.db.transition(source_id, 'completed', upstream_id='job-1')
             source = app.db.task(source_id)
+            seed_approved_template(app, 7,'Для доотправки','reply_links',{'draft':{'replies':['Ответ']}})
 
             async def empty_topup(method, path, **kwargs):
                 return {'available': True, 'failed': 0, 'all': 0, 'repliesPerComment': 2}

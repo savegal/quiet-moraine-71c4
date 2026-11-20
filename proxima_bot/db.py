@@ -4,12 +4,13 @@ import json
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 from .accounts import valid_task_folder
+from .config import DEFAULT_OPEN_TASKS
 
 OPEN_STATES = ('queued','reconcile','starting','running','paused','stopping')
 ACTIVE_STATES = ('starting','running','paused','stopping')
@@ -253,14 +254,19 @@ class Store:
                 self.conn.execute('ROLLBACK')
             raise
 
-    def _task_accounts(self, *, include_queued: bool = False, exclude_task: str = '') -> tuple[set[str], bool]:
+    def _task_accounts(self, *, include_queued: bool = False, exclude_task: str = '',
+                       exclude_user_id: int | None = None) -> tuple[set[str], bool]:
         conditions = IN_FLIGHT_SQL
         if include_queued:
             conditions += " OR state='queued'"
         query = f'SELECT state,payload_json,launch_payload_json FROM tasks WHERE ({conditions}) AND task_id<>?'
+        params=(*IN_FLIGHT_STATES,exclude_task)
+        if exclude_user_id is not None:
+            query+=' AND user_id<>?'
+            params+= (exclude_user_id,)
         accounts = set()
         unknown_pool = False
-        for row in self.conn.execute(query, (*IN_FLIGHT_STATES, exclude_task)):
+        for row in self.conn.execute(query,params):
             sent = row['launch_payload_json'] if row['state'] != 'queued' else None
             try:
                 ids = payload_account_ids(json.loads(sent or row['payload_json']))
@@ -452,7 +458,10 @@ class Store:
         if backup:
             self.save_draft(uid,backup['mode'],backup['step'],backup['data'])
 
-    def queue_task(self, uid:int, name:str, kind:str, payload:dict, *, followup_source:str|None=None, followup_mode:str|None=None, max_daily:int=100, max_open:int=3, fire_at:int=0, draft_token:str|None=None, target_count:int=0) -> str:
+    def queue_task(self, uid:int, name:str, kind:str, payload:dict, *, followup_source:str|None=None,
+                   followup_mode:str|None=None, max_daily:int=100, max_open:int=DEFAULT_OPEN_TASKS,
+                   fire_at:int=0, draft_token:str|None=None, target_count:int=0,
+                   template_allowed:Callable[[],bool]|None=None) -> str:
         timestamp = now()
         if fire_at and not timestamp + 60 <= fire_at <= timestamp + 365 * 86400:
             raise ValueError('Укажи время запуска от 1 минуты до 365 дней вперёд.')
@@ -467,6 +476,8 @@ class Store:
                 draft=self.draft(uid)
                 if not draft or draft['step']!='review' or draft['data'].get('wizard_token')!=draft_token:
                     raise ValueError('Подтверждение устарело. Открой актуальный черновик.')
+            if template_allowed is not None and not template_allowed():
+                raise ValueError('Шаблон изменился. Выбери одобренную версию заново.')
             if max_daily>0:
                 day_start=local_day_start(now(), getattr(self, 'timezone_name', 'Europe/Moscow'))
                 daily=self.conn.execute('SELECT COUNT(*) FROM tasks WHERE user_id=? AND created_at>=?',
@@ -601,9 +612,10 @@ class Store:
                 # accounts a replay can now reach if the first request never created a task.
                 launch_ids.update(replay_scope)
                 reservation = {**launch_payload, 'assets': {**launch_payload['assets'], 'accountIds': sorted(launch_ids)}}
-            used, unknown_pool = self._task_accounts(exclude_task=task_id)
+            is_owner=task['user_id']==owner_id
+            used, unknown_pool = self._task_accounts(exclude_user_id=task['user_id'])
             owner_cabinet_scope = (
-                task['user_id'] == owner_id
+                is_owner
                 and expected_state == 'queued'
                 and not task['launch_payload_json']
                 and valid_task_folder(saved_payload.get('accountFolder'), allow_workspace=True)
@@ -724,7 +736,7 @@ class Store:
           AND (u.user_id=? OR (u.blocked=0 AND u.expires_at>?))
           ORDER BY CASE t.state WHEN 'reconcile' THEN 0 ELSE 1 END,t.created_at,t.rowid
         ''', (*RECONCILE_HOLD_CODES,timestamp,timestamp,owner_id,timestamp))
-        in_flight = self._task_accounts()
+        in_flight = {}
         for row in candidates:
             try:
                 payload = json.loads(row['launch_payload_json'] or row['payload_json'])
@@ -733,7 +745,10 @@ class Store:
                 return dict(row)  # Let the worker surface the invalid order.
             if not ids:
                 return dict(row)
-            busy, unknown_pool = self._task_accounts(exclude_task=row['task_id']) if row['state']=='reconcile' else in_flight
+            user_id=row['user_id']
+            if user_id not in in_flight:
+                in_flight[user_id]=self._task_accounts(exclude_user_id=user_id)
+            busy,unknown_pool=in_flight[user_id]
             if not unknown_pool and not ids.intersection(unavailable | busy):
                 return dict(row)
         return None

@@ -7,10 +7,11 @@ import json
 import pytest
 
 from proxima_bot.api import ApiError, Tokora
+from proxima_bot.advanced_db import ExtendedStore
 from proxima_bot.config import Config
 from proxima_bot.db import Store
 from proxima_bot.worker import Worker
-from test_extended import button_callback, new_app
+from test_extended import button_callback, new_app, select_order_template
 from test_worker import FakeTelegram, FakeTokora
 
 
@@ -108,6 +109,50 @@ class ConcurrentTokora(FakeTokora):
         job_id = f'job-{len(self.started)}'
         self.final.setdefault(job_id, {'id': job_id, 'state': 'running'})
         return {'id': job_id, 'state': 'running', 'done': 0, 'total': 2}
+
+
+def test_owner_shares_workspace_pool_with_site_tasks_and_retries_when_tokora_is_busy():
+    class Provider(ConcurrentTokora):
+        async def start(self, payload):
+            result=await super().start(payload)
+            self.active.append(result)
+            return result
+
+    async def run():
+        with closing(ExtendedStore(':memory:')) as db:
+            db.owner_id=99
+            db.grant(7,30)
+            db.assign(7,'shared')
+            account={'assets':{'accountIds':['shared']}}
+            orders=[db.queue_task(99,f'Заказ {i}','fetch',{**account,'accountFolder':''}) for i in range(4)]
+            api=Provider()
+            api.folders['']={'shared':_tokora_account('shared')}
+            api.active=[{'id':'from-site-1','state':'running'}, {'id':'from-site-2','state':'running'}]
+            worker=Worker(db,api,FakeTelegram(),Config('fake','fake',99,dispatch_enabled=True))
+
+            api.issue=ApiError('job_busy',409)
+            await worker.tick()
+            assert db.task(orders[0])['state']=='queued' and db.task(orders[0])['error_code']=='job_busy'
+            request_id=api.started[0]['requestId']
+            api.issue=None
+            worker.next_dispatch_at=0
+            for _ in range(4):
+                await worker.tick()
+
+            assert api.started[1]['requestId']==request_id
+            assert len(api.active)==5
+            assert [db.task(tid)['state'] for tid in orders]==['running','running','running','queued']
+            assert len(api.started)==4
+            assert all(payload['accountFolder']=='' and payload['assets']['accountIds']==['shared'] for payload in api.started)
+
+            member=db.queue_task(7,'Трафер','fetch',account)
+            api.active=[item for item in api.active if item['id']!='from-site-1']
+            await worker.tick()
+            assert db.task(orders[-1])['state']=='running'
+            assert db.task(member)['state']=='queued'
+            assert len(api.active)==5
+
+    asyncio.run(run())
 
 
 def test_owner_workspace_waits_for_active_traffer_and_blocks_overlap_and_runs_disjoint_none_concurrently():
@@ -307,8 +352,12 @@ def test_owner_assigned_mode_templates_repeat_and_topup_behavior():
             assert tr_topup_payload['assets']['accountIds'] == ['acc7']
 
             # 4. Copying a job strips stale accountFolder for non-owner and updates to active scope for owner.
-            app.save_wizard_step(7, 'task_copy', 'review', {'name': 'Copy', 'job': {'kind': 'publish', 'accountFolder': '', 'awemeIds': ['1'], 'assets': {'accountIds': ['acc7']}}})
+            app.save_wizard_step(7, 'task_copy', 'review', {'name': 'Copy', 'job': {'kind': 'publish', 'accountFolder': '', 'awemeIds': ['7420000000000000000'], 'assets': {'accountIds': ['acc7']}}})
             await app.copy_preview(7)
+            await app.callback(7, {'data': button_callback(app, 'wiz:submit:')})
+            assert app.db.draft(7)['step']=='choose_template'
+            await select_order_template(app,7,'publish',comments=['Текст'])
+            await app.callback(7, {'data': button_callback(app, 'wiz:quick:')})
             await app.callback(7, {'data': button_callback(app, 'wiz:submit:')})
             tr_copy = [t for t in app.db.recent_tasks(7) if t['task_id'] != tr_topup['task_id']][0]
             assert 'accountFolder' not in json.loads(tr_copy['payload_json'])

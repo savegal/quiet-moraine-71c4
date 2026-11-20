@@ -16,7 +16,7 @@ from .db import (RECONCILE_HOLD_CODES, TERMINAL_STATES, UNKNOWN_TASK_POOL, PER_L
                  Store, now, payload_account_ids, remote_task_name, task_execution_limit_seconds)
 from .config import Config
 from .operations import VALID_ID
-from .presentation import h
+from .presentation import h, public_system_text
 
 log=logging.getLogger(__name__)
 BUSY={'job_busy','rate_limited'}
@@ -81,11 +81,18 @@ def verified_launch_folder(job: dict, owner_id: int | None = None) -> str | None
     return folder if valid_task_folder(folder, allow_workspace=allow_workspace) else None
 
 
+def remote_only_tasks(active: list[dict], running: list[dict]) -> list[dict]:
+    running_ids = {job['upstream_id'] for job in running if job['upstream_id']}
+    return [job for job in active if job.get('kind') != 'import' and job['id'] not in running_ids]
+
+
 class Worker:
     def __init__(self,store:Store,tokora:Tokora,tg:Telegram,config:Config,
-                 *, dispatch_allowed: Callable[[], bool] | None = None):
+                 *, dispatch_allowed: Callable[[], bool] | None = None,
+                 report_task_error: Callable[[str,dict,dict|None],None] | None = None):
         self.store,self.tokora,self.tg,self.config=store,tokora,tg,config
         self.dispatch_allowed = dispatch_allowed
+        self.report_task_error = report_task_error
         self.warned:dict[str,float]={}
         self.next_dispatch_at=0.0
         self.next_reconcile_at=0.0
@@ -93,11 +100,16 @@ class Worker:
         self.next_balance_check_at=0.0
         self.status_retry_at: dict[str, float] = {}
 
+    def report_finished_task(self, job:dict, state:str, snapshot:dict)->None:
+        if self.report_task_error and state in TERMINAL_STATES:
+            previous = json.loads(job.get('snapshot_json') or '{}') if job['state'] in TERMINAL_STATES else None
+            self.report_task_error(job['task_id'],snapshot,previous)
+
     async def alert(self, code:str,task_id:str='',detail:str='')->None:
         timestamp=time.monotonic()
         if timestamp-self.warned.get(code,float('-inf'))<1800:return
         self.warned[code]=timestamp
-        text='<b>! Proxima Soft · API</b>\nНужна проверка: <code>'+h(code[:100])+'</code>'
+        text='<b>! Proxima Soft · Диагностика</b>\nНужна проверка · <code>'+h(public_system_text(code)[:100])+'</code>'
         if code=='reconcile_scope_unknown':
             text+='\n'+h(UNKNOWN_TASK_POOL)
         elif code.startswith('account_folder_mismatch'):
@@ -111,7 +123,7 @@ class Worker:
         elif code=='missing_proxies':
             text+='\nНе хватает прокси для запуска. Проверь раздел прокси в /admin.'
         if detail:
-            text+='\n'+h(detail[:250])
+            text+='\n'+h(public_system_text(detail)[:250])
         if task_id:text+='\nЗаказ: <code>'+h(task_id)+'</code> · /admin'
         try:await asyncio.wait_for(self.tg.send(self.config.owner_id,text),timeout=5)
         except Exception:log.exception('Failed to deliver admin alert')
@@ -171,9 +183,10 @@ class Worker:
             prev_snap=json.loads(job.get('snapshot_json') or '{}')
             if prev_snap.get('executionTimeLimit'):
                 result={**result,'executionTimeLimit':True,'executionLimitSeconds':prev_snap.get('executionLimitSeconds') or limit_seconds}
-            self.store.transition(job['task_id'],state,snapshot=result,
+            changed=self.store.transition(job['task_id'],state,snapshot=result,
                 error_code='execution_failed' if state=='failed' else '',expected_state=job['state'],
                 expected_snapshot=job['snapshot_json'])
+            if changed:self.report_finished_task(job,state,result)
             self.status_retry_at.pop(task_id, None)
         except ApiError as exc:
             if exc.status==404 or exc.code in ('job_not_found','not_found'):
@@ -197,9 +210,10 @@ class Worker:
             state=snapshot_state(result,job['state'])
             if result.get('id')!=job['upstream_id'] or not state:
                 raise ApiError('invalid_response')
-            self.store.transition(job['task_id'],state,snapshot=result,observed_at=observed,
+            changed=self.store.transition(job['task_id'],state,snapshot=result,observed_at=observed,
                                   expected_state=job['state'],expected_snapshot=job['snapshot_json'],
                                   error_code='execution_failed' if state=='failed' else '')
+            if changed:self.report_finished_task(job,state,result)
         except ApiError as exc:
             retry_at=0 if exc.status==404 else now()+max(15,exc.retry_after)
             self.store.defer_settlement(job,retry_at)
@@ -260,6 +274,7 @@ class Worker:
                     try:
                         if self.store.transition(job['task_id'],state,upstream_id=result['id'],snapshot=result,
                                 error_code='execution_failed' if state=='failed' else '',expected_state='reconcile'):
+                            self.report_finished_task(job,state,result)
                             continue
                     except sqlite3.IntegrityError:
                         self.store.hold_reconciliation(job['task_id'])
@@ -300,19 +315,15 @@ class Worker:
         # An idempotent replay can create the first remote job. Apply the same
         # workspace and subscription guards as on a fresh launch.
         running = self.store.running()
-        running_ids = {job['upstream_id'] for job in running if job['upstream_id']}
-        remote_only = [job for job in active if job.get('kind')!='import' and job['id'] not in running_ids]
+        remote_only = remote_only_tasks(active, running)
         local_limit = limit - len(remote_only)
         if len(running) >= local_limit:
             return
-        # Tokora can list the current folder but does not expose the historical launch set.
-        unresolved = self.store.unresolved_tasks()
-        known_ids = {job['upstream_id'] for job in unresolved if verified_launch_folder(job, self.config.owner_id) is not None}
-        if (any(job['id'] not in known_ids for job in remote_only)
-                or any(verified_launch_folder(job, self.config.owner_id) is None for job in (*running,*unresolved)
-                       if job['task_id'] != task_id)):
-            if previous=='queued' and queued['error_code']!='external_pool_unknown':
-                self.store.transition(task_id,'queued',error_code='external_pool_unknown',expected_state='queued')
+        # Website tasks consume slots. For bot jobs we also protect pools used by other users.
+        if any(job['user_id']!=queued['user_id'] and verified_launch_folder(job,self.config.owner_id) is None
+               for job in (*running,*self.store.unresolved_tasks())):
+            if previous=='queued' and queued['error_code']!='local_pool_unknown':
+                self.store.transition(task_id,'queued',error_code='local_pool_unknown',expected_state='queued')
             return
         if previous=='reconcile' and queued['reconcile_attempts']>=RECONCILE_RETRY_LIMIT:
             self.store.hold_reconciliation(task_id)
@@ -425,8 +436,9 @@ class Worker:
             if not isinstance(upstream_id,str) or not VALID_ID.fullmatch(upstream_id):
                 raise ApiError('missing_response_id')
             state=snapshot_state(result) or 'running'
-            self.store.transition(task_id,state,upstream_id=upstream_id,snapshot=result,
-                                  error_code='execution_failed' if state=='failed' else '',expected_state='starting')
+            if self.store.transition(task_id,state,upstream_id=upstream_id,snapshot=result,
+                                     error_code='execution_failed' if state=='failed' else '',expected_state='starting'):
+                self.report_finished_task(current,state,result)
         except ApiError as exc:
             await self.start_failed(task_id,previous,exc)
         except sqlite3.IntegrityError:
@@ -592,7 +604,7 @@ class Worker:
             self.store.transition(task_id,state,preflight={**stage,'phase':'waiting'},expected_state=state)
             return None
         if owner_cabinet:
-            used,unknown_pool=self.store._task_accounts(exclude_task=task_id)
+            used,unknown_pool=self.store._task_accounts(exclude_user_id=self.config.owner_id)
             if unknown_pool or set(requested).intersection(used):
                 self.store.transition(task_id,state,preflight={**stage,'phase':'waiting'},expected_state=state)
                 return None
@@ -620,7 +632,7 @@ class Worker:
         delay=0.0
         alert=''
         if exc.status==429 or exc.code in BUSY:
-            state,error=previous,'' if exc.code=='job_busy' else exc.code
+            state,error=previous,exc.code
             delay=max(self.config.poll_seconds,exc.retry_after)
         elif exc.code in UNCERTAIN or exc.status==0 or exc.status>=500:
             state,error='reconcile',exc.code

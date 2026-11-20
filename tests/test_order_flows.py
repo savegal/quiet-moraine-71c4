@@ -11,7 +11,7 @@ from proxima_bot.config import Config
 from proxima_bot.operations import load_spec, valid_body
 from proxima_bot.worker import Worker
 
-from test_extended import FakeAPI, button_callback, new_app, collected_cid
+from test_extended import seed_approved_template, approve_template, FakeAPI, button_callback, new_app, collected_cid, select_order_template
 from test_worker import FakeTokora
 from test_api_coverage import sample
 
@@ -168,9 +168,8 @@ def test_owner_can_attach_photos_and_use_cabinet_defaults():
         app=new_app()
         app.db.assign(OWNER,'owner-account')
         await app.begin(OWNER,'publish')
-        await click(app,OWNER,'wiz:auto_name:')
-        for value in (VIDEO_ID,'Комментарий','Ответ'):
-            await app.input_draft(OWNER,value)
+        await select_order_template(app,OWNER,'publish',comments=['Комментарий'],replies=['Ответ'])
+        await app.input_draft(OWNER,VIDEO_ID)
         await click(app,OWNER,'wiz:quick:')
         await click(app,OWNER,'wiz:photo_both:')
         await click(app,OWNER,'wiz:submit:')
@@ -191,8 +190,8 @@ def test_member_cannot_enable_shared_photos_from_callback():
     async def run():
         app=new_app()
         await app.begin(MEMBER,'publish')
-        for value in ('Тест',VIDEO_ID,'Текст','Ответ'):
-            await app.input_draft(MEMBER,value)
+        await select_order_template(app,MEMBER,'publish',comments=['Текст'],replies=['Ответ'])
+        await app.input_draft(MEMBER,VIDEO_ID)
         await click(app,MEMBER,'wiz:quick:')
         token=app.db.draft(MEMBER)['data']['wizard_token']
         await app.callback(MEMBER,{'data':'wiz:photo_both:'+token})
@@ -213,7 +212,7 @@ def test_owner_can_attach_photos_to_replies_from_collected_comments():
         app.db.transition(source,'completed',upstream_id='source')
         await app.callback(OWNER,{'data':'source_reply:'+source})
         await app.input_draft(OWNER,'100')
-        await app.input_draft(OWNER,'Ответ')
+        await select_order_template(app,OWNER,'source_reply',replies=['Ответ'])
         await click(app,OWNER,'source:skip:')
         await click(app,OWNER,'source:photo:')
         assert app.db.draft(OWNER)['data']['photo_mode']=='replies'
@@ -246,6 +245,10 @@ def test_each_order_from_menu_through_template_dispatch_and_results(mode):
         await app.create(uid)
         await click(app, uid, 'new:' + mode)
         inputs, expected = SCENARIOS[mode]
+        if mode in ('publish','reply_links','keyword_reply'):
+            assets=expected['assets']
+            await select_order_template(app,uid,mode,comments=assets.get('commentTexts',[]),replies=assets['replyTexts'])
+            inputs=inputs[:2 if mode=='keyword_reply' else 1]
         assert app.db.draft(uid)['step']!='name'
         for value in inputs:
             await app.input_draft(uid, value)
@@ -262,11 +265,12 @@ def test_each_order_from_menu_through_template_dispatch_and_results(mode):
 
         await click(app, uid, 'wiz:template:')
         await click(app, uid, 'lt:save:')
-        template, = app.db.templates(uid)
+        template = app.db.templates(uid)[0]
+        await approve_template(app,uid,template['template_id'])
         assert template['mode'] == mode
         assert app.db.template(8, template['template_id']) is None
-        await click(app, uid, 'templates')
-        await click(app, uid, 'tpl:')
+        await app.callback(uid,{'data':'templates'})
+        await click(app, uid, 'tpl:'+template['template_id'])
         await click(app, uid, 'tpl_use:')
         if mode!='feedwarm':
             await app.input_draft(uid, COMMENT if mode in ('reply_links','commentlike') else VIDEO)
@@ -366,15 +370,14 @@ def test_source_template_selects_own_collection_and_excludes_old_source():
         other = app.db.queue_task(8, 'Чужой сбор', 'fetch', {'assets': {'accountIds': ['acc8']}})
         for task_id, provider_id in [(old, 'old'), (new, 'new'), (other, 'other')]:
             app.db.transition(task_id, 'completed', upstream_id=provider_id)
-        await app.callback(MEMBER, {'data': 'source_reply:' + old})
-        await app.input_draft(MEMBER,'100')
+        await app.edit_local_template(MEMBER,'source_reply')
+        await app.input_draft(MEMBER,'Ответы на сбор')
         await app.input_draft(MEMBER, 'Сохранённый текст')
-        await click(app, MEMBER, 'source:skip:')
-        await click(app, MEMBER, 'source:template:')
+        await click(app, MEMBER, 'lt:keep:')
         await click(app, MEMBER, 'lt:save:')
         template, = app.db.templates(MEMBER)
         tid = template['template_id']
-        saved=json.loads(app.db.template(MEMBER,tid)['payload'])
+        saved=json.loads((await approve_template(app,MEMBER,tid))['payload'])
         assert saved['replies']==['Сохранённый текст']
         assert saved['options']['repliesPerComment']==3 and saved['options']['likeEnabled'] is True
         await app.from_template(MEMBER, tid)
@@ -400,7 +403,7 @@ def test_source_template_selects_own_collection_and_excludes_old_source():
 def test_template_last_page_is_accessible_and_deletes_its_own_template():
     async def run():
         app = new_app()
-        ids = [app.db.save_template(MEMBER, f'Шаблон {n}', 'fetch', {}) for n in range(50)]
+        ids = [seed_approved_template(app, MEMBER, f'Шаблон {n}', 'fetch', {}) for n in range(50)]
         await app.templates(MEMBER)
         for page in range(1, 5):
             await click(app, MEMBER, 'templates_page:' + str(page))
@@ -453,7 +456,7 @@ def test_older_keyword_template_keeps_texts_and_asks_for_video():
     async def run():
         app = new_app()
         try:
-            template = app.db.save_template(MEMBER, 'Старый шаблон', 'keyword_reply', {
+            template = seed_approved_template(app, MEMBER, 'Старый шаблон', 'keyword_reply', {
                 'draft': {'name': 'Шаблон', 'keywords': ['поиск'], 'replies': ['Ответ']},
             })
             await app.from_template(MEMBER, template)
@@ -531,6 +534,8 @@ def test_topup_only_launches_once_for_each_confirmation(mode):
         source = app.db.queue_task(MEMBER, 'Публикация', 'publish',
                                    {'assets': {'accountIds': ['acc7'], 'replyTexts': ['Ответ']}})
         app.db.transition(source, 'completed', upstream_id='source')
+        if mode=='reply':
+            seed_approved_template(app, MEMBER,'Для доотправки','reply_links',{'draft':{'replies':['Ответ']}})
 
         async def topup_info(method, path, **kwargs):
             assert method == 'GET' and path == f'/v1/tasks/source/{mode}-topup'
@@ -673,7 +678,7 @@ def test_invalid_or_incomplete_reply_inputs_keep_the_draft_and_allow_retry():
     async def run():
         app = new_app()
         await app.begin(MEMBER, 'reply_links')
-        await app.input_draft(MEMBER, 'Повтор ввода')
+        await select_order_template(app,MEMBER,'reply_links',replies=['Текст'])
         await app.input_draft(MEMBER, 'https://not-tiktok.example/')
         assert app.db.draft(MEMBER)['step'] == 'reply_links'
 
@@ -685,8 +690,7 @@ def test_invalid_or_incomplete_reply_inputs_keep_the_draft_and_allow_retry():
         app.tg.fetch_upload = upload
         for file_id in ('unavailable', 'ok'):
             await app.handle_upload(MEMBER, {'document': {'file_id': file_id, 'file_name': 'input.txt'}})
-            assert app.db.draft(MEMBER)['step'] == ('reply_links' if file_id == 'unavailable' else 'replies')
-        await app.input_draft(MEMBER, 'Текст')
+            assert app.db.draft(MEMBER)['step'] == ('reply_links' if file_id == 'unavailable' else 'options')
         await click(app, MEMBER, 'wiz:skip:')
         await click(app, MEMBER, 'wiz:skip:')
         await click(app, MEMBER, 'wiz:submit:')

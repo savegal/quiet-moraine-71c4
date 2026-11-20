@@ -55,7 +55,10 @@ class MediaOrderFormMixin:
     async def begin_media_order(self,uid:int,oid:str)->None:
         if not self.owner(uid) or not VALID_ID.fullmatch(oid):return
         try:
-            self.db.save_draft(uid,'media_order','review',await self.load_media_order(oid))
+            order=await self.load_media_order(oid)
+            if self.mode_restricted(uid,order['kind']+'_post'):
+                raise ValueError('Этот вид публикации скрыт в настройках.')
+            self.db.save_draft(uid,'media_order','review',order)
             await self.media_order_screen(uid)
         except (ApiError,ValueError) as exc:
             message=self.account_error_message(uid,exc) if isinstance(exc,ApiError) else h(exc)
@@ -65,6 +68,8 @@ class MediaOrderFormMixin:
         draft=self.db.draft(uid)
         if not self.owner(uid) or not draft or draft['mode']!='media_order':return
         data=draft['data']
+        if self.mode_restricted(uid,data['kind']+'_post'):
+            return await self.say(uid,'Этот вид публикации скрыт в настройках.')
         token,settings=data['token'],data['settings']
         route=lambda verb:'mo:'+verb+':'+token
         field=data.get('field')
@@ -126,6 +131,9 @@ class MediaOrderFormMixin:
         if not draft or draft['mode']!='media_order':return False
         if not self.owner(uid):return True
         data=draft['data']
+        if self.mode_restricted(uid,data['kind']+'_post'):
+            await self.say(uid,'Этот вид публикации скрыт в настройках.')
+            return True
         field=data.get('field')
         try:
             if field=='perAccount':
@@ -163,12 +171,16 @@ class MediaOrderFormMixin:
         if verb=='cancel':
             self.db.clear_draft(uid)
             return await self.draft_info(uid,data['id'])
+        if self.mode_restricted(uid,data['kind']+'_post'):
+            return await self.say(uid,'Этот вид публикации скрыт в настройках.')
         if verb=='prepare':
             try:
                 settings=data['settings']
                 if not 1<=settings['perAccount']<=100:raise ValueError('Укажи от 1 до 100 публикаций на аккаунт.')
                 if not settings['allAccounts'] and not settings['accountIds']:raise ValueError('Выбери аккаунты для публикации.')
                 await self.media_draft_for_plan(data['id'],kind=data['kind'])
+                if self.mode_restricted(uid,data['kind']+'_post'):
+                    raise ValueError('Этот вид публикации скрыт в настройках.')
                 self._allowed_fields(settings,'PostSettings')
                 data['token']=token_hex(6)
                 self.db.save_draft(uid,'media_order','review',data)
@@ -181,7 +193,7 @@ class MediaOrderFormMixin:
                     if patch.get('ownSettings'):
                         patch.update({key:settings[key] for key in MEDIA_DRAFT_SETTINGS_FIELDS})
                     await self.api.call('PATCH','/v1/posts/drafts/'+data['id'],payload=patch,retries=0)
-                await self.create_post_plan(uid,{'draftIds':[data['id']],'settings':settings})
+                await self.create_post_plan(uid,{'draftIds':[data['id']],'settings':settings},kind=data['kind'])
                 self.db.clear_draft(uid)
             except (ApiError,ValueError) as exc:
                 message=self.account_error_message(uid,exc) if isinstance(exc,ApiError) else str(exc)

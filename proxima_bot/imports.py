@@ -163,10 +163,13 @@ class ImportSummary:
     stopped:str=''
 
 
-async def _import_one(api:Tokora,db:Store,uid:int,entry:dict,seen:set[str])->tuple[str,dict]:
+async def _import_one(api:Tokora,db:Store,uid:int,entry:dict,seen:set[str],*,self_service:bool=False,
+                      allowed:Callable[[],bool]|None=None)->tuple[str,dict]:
     for attempt in range(2):
         try:
             with db.account_action(None,user_id=uid):
+                if allowed and not allowed():
+                    raise ValueError('Доступ или пул аккаунтов изменился. Открой импорт заново.')
                 if db.account_check_pending():
                     raise ValueError('Дождись окончания общей проверки аккаунтов.')
                 check=await api.call('POST','/v1/accounts/import/check',payload={'cookies':entry['cookies']},
@@ -174,16 +177,23 @@ async def _import_one(api:Tokora,db:Store,uid:int,entry:dict,seen:set[str])->tup
                 exists,aid=check.get('exists'),check.get('accountId')
                 if 'exists' not in check or 'accountId' not in check or (exists is not None and type(exists) is not bool):
                     raise ApiError('invalid_response')
+                if self_service and exists is False:
+                    identified_uid=check.get('uid')
+                    if (not isinstance(identified_uid,str) or not identified_uid.isascii()
+                            or not identified_uid.isdecimal() or check.get('hidden') is not False):
+                        return 'unverified',{}
                 if exists is True:
                     if not isinstance(aid,str) or not VALID_ID.fullmatch(aid):
                         raise ApiError('invalid_response')
                     assignee=db.account_assignee(aid)
-                    if assignee is not None and assignee!=uid:return 'conflicts',{}
+                    if assignee!=uid and (self_service or assignee is not None):return 'conflicts',{}
                     if aid in seen:return 'duplicates',{}
                 elif aid is not None:
                     raise ApiError('invalid_response')
-                elif exists is None and db.has_other_account_assignees(uid):
+                elif exists is None and (self_service or db.has_other_account_assignees(uid)):
                     return 'unverified',{}
+                if allowed and not allowed():
+                    raise ValueError('Доступ или пул аккаунтов изменился. Открой импорт заново.')
                 result=await api.call('POST','/v1/accounts/import',payload=entry,retries=0,background=True)
                 account=result.get('account')
                 if exists is True and (not isinstance(account,dict) or account.get('accountId')!=aid):
@@ -198,17 +208,18 @@ async def _import_one(api:Tokora,db:Store,uid:int,entry:dict,seen:set[str])->tup
 async def import_and_assign(api:Tokora,db:Store,uid:int,accounts:list[dict],*,
                             on_progress:Callable[[ImportSummary],None]|None=None,
                             on_assignment:Callable[[str,bool],None]|None=None,
-                            should_stop:Callable[[],bool]|None=None)->ImportSummary:
+                            should_stop:Callable[[],bool]|None=None,
+                            self_service:bool=False,allowed:Callable[[],bool]|None=None)->ImportSummary:
     if not 0<uid<=MAX_USER_ID:raise ValueError('Некорректный Telegram ID.')
     summary=ImportSummary(len(accounts))
     seen=set()
     for entry in accounts:
         if should_stop and should_stop():
-            summary.stopped='остановлено владельцем'
+            summary.stopped='Остановлено пользователем' if self_service else 'остановлено владельцем'
             break
         summary.attempted+=1
         try:
-            skipped,result=await _import_one(api,db,uid,entry,seen)
+            skipped,result=await _import_one(api,db,uid,entry,seen,self_service=self_service,allowed=allowed)
             if skipped:
                 setattr(summary,skipped,getattr(summary,skipped)+1)
                 continue

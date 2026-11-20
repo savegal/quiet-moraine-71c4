@@ -9,7 +9,7 @@ from proxima_bot.config import Config
 from proxima_bot.db import Store
 from proxima_bot.presentation import task_rich
 from proxima_bot.worker import Worker
-from test_extended import button_callback, new_app, collected_entry, collected_cid
+from test_extended import approved_order_data, button_callback, new_app, collected_entry, collected_cid, select_order_template
 from test_order_flows import COMMENT, REPLY_TARGET, VIDEO_ID
 from test_worker import FakeTelegram, FakeTokora
 
@@ -29,7 +29,10 @@ def test_confirmation_persists_order_without_any_provider_calls(mode, targets):
         app.api.call = unavailable
         app.api.resolve = unavailable
         try:
-            app.save_wizard_step(7, mode, 'review', {'name': 'Очередь', **targets})
+            data={'name':'Очередь',**targets}
+            if mode in ('publish','reply_links'):
+                data=approved_order_data(app,7,mode,data)
+            app.save_wizard_step(7, mode, 'review', data)
             await app.preview(7)
             submit = button_callback(app, 'wiz:submit:')
             await app.callback(7, {'data': submit})
@@ -46,7 +49,7 @@ def test_confirmation_persists_order_without_any_provider_calls(mode, targets):
 
 
 @pytest.mark.parametrize('links', ['video', 'reply'])
-def test_worker_resolves_only_after_workspace_is_free_and_retries_busy_resolver(links):
+def test_worker_resolves_only_after_slot_is_free_and_retries_busy_resolver(links):
     class Provider(FakeTokora):
         def __init__(self):
             super().__init__()
@@ -68,7 +71,7 @@ def test_worker_resolves_only_after_workspace_is_free_and_retries_busy_resolver(
             raw = {'awemeIds': ['https://vt.tiktok.com/example/']} if links == 'video' else {'replyLinks': [COMMENT]}
             tid = db.queue_task(7, 'Ждём', 'publish', {'assets': {'accountIds': ['a']}, **raw})
             api = Provider(); api.active = [{'id': 'other', 'state': 'running'}]
-            worker = Worker(db, api, FakeTelegram(), Config('fake', 'fake', 99, dispatch_enabled=True))
+            worker = Worker(db, api, FakeTelegram(), Config('fake', 'fake', 99, dispatch_enabled=True, max_active_external=1))
             await worker.tick()
             assert api.resolutions == 0 and api.started == []
             api.active = []
@@ -296,6 +299,9 @@ def test_recover_rejected_collection_reply_preserves_targets_and_settings():
             await app.task(7, failed)
             assert 'Проверить и повторить' in str(app.tg.out[-1][2])
             await app.callback(7, {'data': button_callback(app, 'repeat:')})
+            assert app.db.draft(7)['step']=='replies'
+            await select_order_template(app,7,'source_reply',replies=['Текст из заказа'])
+            await app.callback(7,{'data':button_callback(app,'source:skip:')})
             assert app.db.draft(7)['data']['target_cids'] == [collected_cid(3),collected_cid(1)]
             assert 'Текст из заказа' in app.tg.out[-1][1]
             assert '20 минут' in app.tg.out[-1][1]

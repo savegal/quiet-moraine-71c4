@@ -5,6 +5,7 @@ Subscription and order confirmations are tied to the owner's own draft.
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
@@ -15,18 +16,29 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 from .accounts import ACCOUNT_STATUS,session_state
 from .catalog import MODES, OWNER_ONLY
-from .db import ACTIVE_STATES, MAX_USER_ID, PUBLICATION_TIMER_KINDS, now, snapshot_preparing
-from .presentation import ERROR_LABELS, days_label, keyboard, number, pagination, state_label, state_symbol, task_view, task_rich, report_view, table_html, h
-from .rich_ui import screen
-from .api import ACCOUNT_FOLDER_ID, ApiError
+from .admission import ENTRY_LIST
+from .order_templates import MEDIA_TEMPLATE_MODES
+from .db import ACTIVE_STATES, MAX_USER_ID, PUBLICATION_TIMER_KINDS, now, payload_account_ids, snapshot_preparing
+from .presentation import (ERROR_LABELS, days_label, h, keyboard, number, pagination, public_system_text, report_view,
+                           rich_table, state_label, state_symbol, table_html, task_rich, task_view)
+from .rich_ui import disclosure, screen
+from .api import ACCOUNT_FOLDER_ID, ApiError, scan_active_tasks
 from .bot import PUBLICATION_REPORT_KINDS, safe_api_error
-from .worker import marked_task_name, matches_reconciliation, snapshot_state
+from .worker import marked_task_name, matches_reconciliation, remote_only_tasks, snapshot_state
 
 UID=re.compile(r'^[1-9][0-9]{0,18}$')
 TASK=re.compile(r'^[0-9a-f]{8}$')
 ACC=re.compile(r'^[a-zA-Z0-9_-]{1,128}$')
 ORDERS_WITH_VIDEOS={'publish','keyword_reply','fetch','usernames','feedwarm','commentlike'}
 MODE_ACCESS_LABELS={'reply_links':'Ответы по ссылкам и из сбора'}
+CABINET_AUDIT_LABELS={
+    'tokora_key_added':'Подключён ключ кабинета',
+    'tokora_key_enable':'Включён ключ кабинета',
+    'tokora_key_disable':'Выключен ключ кабинета',
+    'tokora_key_delete':'Удалён ключ кабинета',
+    'tokora_workspace_added':'Создан кабинет',
+    'tokora_workspace_member':'Трафер подключён к кабинету',
+}
 
 
 def valid_member_id(value:str)->bool:
@@ -74,6 +86,15 @@ class SafeCsvWriter:
 
 
 class AdminPanelMixin:
+    def _queue_status(self, paused:bool)->str:
+        if paused:return 'На паузе'
+        if not self.cfg.dispatch_enabled:return 'Выключен в .env'
+        if self.db.account_check_pending():return 'Проверка аккаунтов'
+        if self.db.workspace_action_active():return 'Обслуживание кабинета'
+        gate=getattr(self,'cabinet_dispatch_allowed',None)
+        if gate is not None and not gate():return 'Проверка разделения кабинетов'
+        return 'Запуск разрешён'
+
     async def admin_dashboard(self,uid:int):
         if not self.owner(uid):return
         d=self.db.dashboard()
@@ -81,31 +102,38 @@ class AdminPanelMixin:
         owner_status=members_status(owner,0) if owner else ''
         active=d['active']-int(owner_status=='Активен')
         expired=d['expired_users']-int(owner_status=='Без подписки')
-        paused=hasattr(self.db,'dispatch_paused') and self.db.dispatch_paused()
-        queue_state='На паузе' if paused else ('Выкл (.env)' if not self.cfg.dispatch_enabled else 'Активна')
+        paused=self.db.dispatch_paused()
+        summary=[('Очередь запусков',self._queue_status(paused)),
+                 ('Слоты бота',f'{d["running"]} из {self.cfg.max_active_external} занято'),
+                 ('Ожидают запуска',number(d['queued']))]
         rows=[('Траферов',number(d['users']-bool(owner))),
               ('С подпиской / без',f'{number(active)} / {number(expired)}'),
               ('Заблокированы',number(d['blocked_users']-int(owner_status=='Заблокирован'))),
               ('Заказов',number(d['tasks_total'])),
-              ('В очереди / в работе',f'{number(d["queued"])} / {number(d["running"])}'),
               ('Готово / ошибки',f'{number(d["done_tasks"])} / {number(d["failed_tasks"])}'),
-              ('Назначено аккаунтов',number(d['assigned_accounts'])),
-              ('Очередь запусков',queue_state)]
-        rich,plain=table_html('▣ Центр управления',rows)
-        if cabinet_name := getattr(self, 'cabinet_name', ''):
-            rich += '<footer>Кабинет · ' + h(cabinet_name) + '</footer>'
-            plain += '\n\nКабинет · ' + h(cabinet_name)
+              ('Назначено аккаунтов',number(d['assigned_accounts']))]
+        cabinet_name=getattr(self,'cabinet_name','')
+        entry_row=[]
+        if admission:=getattr(self,'bot_admission',None):
+            pending=admission.pending_count()
+            entry_row=[('◇ Заявки на вход'+(f' · {number(pending)}' if pending else ''),ENTRY_LIST,
+                        'primary' if pending else None)]
+        rich,plain=screen('▣ Центр управления',summary,subtitle=cabinet_name)
+        rich+=disclosure('Траферы и статистика',rich_table(('Показатель','Значение'),rows))
+        plain+='\n\n<b>Траферы и статистика</b>\n'+'\n'.join(f'{h(label)} · {h(value)}' for label,value in rows)
         await self.tg.rich(uid,rich,plain,keyboard(
             [('▥ Живая очередь','adm:liveq:0','primary'),
              ('▷ Снять паузу' if paused else 'Ⅱ Пауза очереди','adm:qpause:'+('off' if paused else 'on'),'success' if paused else 'danger')],
             [('◇ Траферы','adm:users:all:0','primary'),('▣ Заказы','adm:jobs:all:0',None)],
-            [('＋ Выдать доступ','adm:pick:grant','success'),('▤ Как подключить','adm:onboard',None)],
+            entry_row,
+            [('▤ Одобрение шаблонов','tr:list:0','primary')],
+            [('＋ Выдать подписку','adm:pick:grant','success'),('▤ Как подключить','adm:onboard',None)],
             [('↑ Импорт себе',f'acctimp:start:{uid}','success'),('▤ Последний импорт',f'acctimp:last:{uid}',None)],
-            [('◇ Мой пул',f'adm:uaccounts:{uid}',None)],
+            [('◇ Мой пул',f'adm:uaccounts:{uid}',None),('▤ Папки кабинета','ac:folders:0',None)],
             [('⌕ Поиск трафера','adm:search',None),('◈ Промокод','promo_create',None)],
             [('◷ Подписки','adm:subs',None),('▣ Виды заказов','adm:modes',None)],
             [('▧ Журнал','adm:audit',None),('⇩ Экспорт CSV','adm:exports',None)],
-            [('⚙︎ Кабинет','adm:api',None),('✓ Проверить API','admin_health',None)],
+            [('⚙︎ Кабинет','adm:api',None),('✓ Диагностика','admin_health',None)],
             *(([('▦ Кабинеты и ключи', 'ws:menu', None)],) if cabinet_name else ()),
             [('↶ Обзор','home',None)]))
 
@@ -120,18 +148,25 @@ class AdminPanelMixin:
             owner_only=mode in restricted
             status='🔒' if owner_only else '✓'
             buttons.append([(f'{status} {label}',f'adm:mode:{mode}:{int(not owner_only)}',None)])
+        for mode,label in MEDIA_TEMPLATE_MODES.items():
+            hidden=self.mode_restricted(uid,mode)
+            buttons.append([(('○ ' if hidden else '✓ ')+label+' · '+('скрыто' if hidden else 'показано'),
+                             f'adm:mode:{mode}:{int(not hidden)}',None)])
         rich,plain=screen('▣ Виды заказов', (('✓','Доступно команде'),('🔒','Только владелец')),
                           subtitle='Выбери вид заказа, чтобы изменить доступ.',
-                          caption='Проверка аккаунтов и публикации видео и фото доступны владельцу.')
+                          caption='Видео и фотоальбомы можно показывать и скрывать отдельно в меню владельца.')
         await self.tg.rich(uid,rich,plain,keyboard(*buttons,[('↶ Панель','admin',None)]))
 
     async def admin_order_mode_confirm(self,uid:int,mode:str,restricted:bool)->None:
-        if not self.owner(uid) or mode not in MODES or mode in OWNER_ONLY:return
-        if restricted==(mode in self.restricted_modes()):return await self.admin_order_modes(uid)
+        if not self.owner(uid) or (mode not in MODES and mode not in MEDIA_TEMPLATE_MODES) or mode in OWNER_ONLY:return
+        media=mode in MEDIA_TEMPLATE_MODES
+        current=self.mode_restricted(uid,mode) if media else mode in self.restricted_modes()
+        if restricted==current:return await self.admin_order_modes(uid)
         nonce=secrets.token_hex(6)
         self.db.save_draft(uid,'admin_order_mode','confirm',{'mode':mode,'restricted':restricted,'nonce':nonce})
-        choice='Оставить только владельцу' if restricted else 'Разрешить команде'
-        label=MODE_ACCESS_LABELS.get(mode,MODES[mode][0])
+        choice=('Скрыть в меню' if restricted else 'Показать в меню') if media else (
+            'Оставить только владельцу' if restricted else 'Разрешить команде')
+        label=MEDIA_TEMPLATE_MODES[mode] if media else MODE_ACCESS_LABELS.get(mode,MODES[mode][0])
         await self.say(uid,f'<b>▣ {h(label)}</b>\n\n{choice}?',keyboard(
             [(f'✓ {choice}',f'adm:modeapply:{nonce}','danger' if restricted else 'success')],
             [('↶ Отмена',f'adm:modecancel:{nonce}',None)]))
@@ -157,33 +192,59 @@ class AdminPanelMixin:
 
     async def admin_live_queue(self,uid:int,page:int=0)->None:
         if not self.owner(uid):return
+        active=None
+        try:
+            async with asyncio.timeout(4):
+                active=await scan_active_tasks(self.api,retries=0)
+        except (ApiError,TimeoutError):
+            pass
         ts=now()
-        paused=hasattr(self.db,'dispatch_paused') and self.db.dispatch_paused()
+        paused=self.db.dispatch_paused()
         queue_states=(*ACTIVE_STATES,'reconcile','queued')
         placeholders=','.join('?' for _ in queue_states)
-        all_rows=self.db.conn.execute(
-            "SELECT task_id,user_id,display_name,kind,state,error_code,snapshot_json,execution_started_at,fire_at,created_at "
+        counts=dict(self.db.conn.execute(
+            f"SELECT state,COUNT(*) FROM tasks WHERE state IN ({placeholders}) GROUP BY state",queue_states))
+        total=sum(counts.values())
+        size=8
+        page=max(0,min(page,(total-1)//size))
+        visible=self.db.conn.execute(
+            "SELECT task_id,user_id,display_name,kind,state,error_code,snapshot_json,execution_started_at,fire_at,payload_json "
             f"FROM tasks WHERE state IN ({placeholders}) "
             "ORDER BY CASE state WHEN 'running' THEN 0 WHEN 'paused' THEN 1 WHEN 'stopping' THEN 2 "
-            "WHEN 'starting' THEN 3 WHEN 'reconcile' THEN 4 ELSE 5 END, created_at ASC, rowid ASC",
-            queue_states,
+            "WHEN 'starting' THEN 3 WHEN 'reconcile' THEN 4 ELSE 5 END, created_at ASC, rowid ASC LIMIT ? OFFSET ?",
+            (*queue_states,size,page*size),
         ).fetchall()
-        size=8
-        page=max(0,min(page,(len(all_rows)-1)//size)) if all_rows else 0
-        visible=all_rows[page*size:(page+1)*size]
-        running_cnt=sum(1 for r in all_rows if r['state'] in ACTIVE_STATES)
-        queued_cnt=sum(1 for r in all_rows if r['state']=='queued')
-        queue_state='На паузе' if paused else ('Выкл (.env)' if not self.cfg.dispatch_enabled else 'Активна')
-        rows=[('Очередь запусков',queue_state),
-              ('Активные / в очереди',f'{number(running_cnt)} / {number(queued_cnt)}')]
-        buttons=[]
+        running=self.db.running()
+        limit=self.cfg.max_active_external
+        rows=[('Очередь запусков',self._queue_status(paused)),('Лимит слотов бота',limit)]
+        notices=[]
+        full=len(running)>=limit
+        if active is None:
+            notices.append('Сводка кабинета недоступна. Показаны только заказы бота.')
+        else:
+            remote_only=remote_only_tasks(active,running)
+            occupied=len(running)+len(remote_only)
+            full=occupied>=limit
+            rows.extend([('Занято всего',occupied),('Свободно по лимиту',max(0,limit-occupied))])
+            if remote_only:
+                rows.append(('Другие задачи кабинета',len(remote_only)))
+        rows.extend([('Занято заказами бота',len(running)),('Ожидают запуска',counts.get('queued',0))])
+        if counts.get('reconcile'):
+            rows.append(('На сверке',counts['reconcile']))
+        if paused:
+            notices.append('Пауза удерживает новые заказы в очереди.')
+        cabinet_name=getattr(self,'cabinet_name','')
+        rich,plain=screen('▥ Живая очередь',rows,subtitle=cabinet_name)
+        if notices:
+            rich+='<blockquote>'+'<br>'.join(h(notice) for notice in notices)+'</blockquote>'
+            plain+='\n\n'+'\n'.join(h(notice) for notice in notices)
+        busy_accounts={}
+        buttons=[[('↻ Обновить',f'adm:liveq:{page}','primary')]]
         for r in visible:
             st=r['state']
-            snap={}
-            with_snap=r['snapshot_json'] or '{}'
-            try:snap=json.loads(with_snap)
-            except Exception:snap={}
             if st=='running':
+                try:snap=json.loads(r['snapshot_json'] or '{}')
+                except (TypeError,ValueError):snap={}
                 started=r['execution_started_at'] or 0
                 preparing=snapshot_preparing(snap)
                 if preparing:
@@ -196,24 +257,35 @@ class AdminPanelMixin:
                     stage+=f' · {max(0,(ts-started)//60)} мин'
             elif st=='queued':
                 fire=r['fire_at'] or 0
-                if fire>ts:stage=f'В очереди · старт через {max(1,(fire-ts+59)//60)} мин'
-                else:stage='В очереди'
-                if r['error_code']:stage+=' · '+ERROR_LABELS.get(r['error_code'],r['error_code'])
+                code=r['error_code']
+                if fire>ts:stage='Запланирован на '+self.format_date(fire)
+                elif code and code!='external_pool_unknown':
+                    stage=ERROR_LABELS.get(code,'Требуется проверка заказа.')
+                else:
+                    try:account_ids=payload_account_ids(json.loads(r['payload_json']))
+                    except (TypeError,ValueError):account_ids=[]
+                    user_id=r['user_id']
+                    if user_id not in busy_accounts:
+                        busy_accounts[user_id],_=self.db._task_accounts(exclude_user_id=user_id)
+                    reserved=busy_accounts[user_id]
+                    if reserved.intersection(account_ids):stage='Ждёт освобождения аккаунтов'
+                    elif full:stage='Ждёт свободного слота'
+                    else:stage='В очереди'
             else:
                 stage=state_label(st)
-                if r['error_code']:stage+=' · '+ERROR_LABELS.get(r['error_code'],r['error_code'])
+                if r['error_code']:stage+=' · '+ERROR_LABELS.get(r['error_code'],'Требуется проверка заказа.')
             who=self._member_label(r['user_id'])
             name=str(r['display_name'] or r['kind'] or r['task_id'])[:28]
-            rows.append((f'{state_symbol(st)} {who[:18]} · {name}',stage))
+            label=f'{state_symbol(st)} {who[:18]} · {name}'
+            rich+=f'<p><b>{h(label)}</b><br>{h(stage)}</p>'
+            plain+=f'\n\n<b>{h(label)}</b>\n{h(stage)}'
             buttons.append([(f'{state_symbol(st)} {who[:14]} · {name[:20]}',f'adm:job:{r["task_id"]}',None)])
         if not visible:
-            rows.append(('Статус','Активных и отложенных заказов сейчас нет'))
-        buttons.append(pagination('adm:liveq:',page,len(all_rows)>(page+1)*size))
+            rich+='<p>У бота сейчас нет активных или отложенных заказов.</p>'
+            plain+='\n\nУ бота сейчас нет активных или отложенных заказов.'
+        buttons.append(pagination('adm:liveq:',page,total>(page+1)*size))
         buttons.append([('▷ Снять паузу' if paused else 'Ⅱ Пауза очереди','adm:lqpause:'+('off' if paused else 'on'),'success' if paused else 'danger'),
-                        ('↻ Обновить',f'adm:liveq:{page}',None)])
-        buttons.append([('↶ Панель','admin',None)])
-        caption='Очередь приостановлена: активные заказы завершатся, новые запуски не уйдут.' if paused else f'Актуально: стр. {page+1}. Нажми на заказ для деталей или остановки.'
-        rich,plain=table_html('▥ Живая очередь',rows,caption)
+                        ('↶ Панель','admin',None)])
         await self.tg.rich(uid,rich,plain,keyboard(*buttons))
 
     async def admin_users(self,uid:int,status:str='all',page:int=0,search:str=''):
@@ -255,13 +327,15 @@ class AdminPanelMixin:
         handle='@'+u['username'] if u.get('username') else ''
         identity=' · '.join(value for value in (name,handle) if value) or '—'
         is_owner=target==self.cfg.owner_id
+        daily_limit=u['daily_limit'] if u['daily_limit'] is not None else self.cfg.max_tasks_per_day
+        open_limit=u['open_limit'] if u['open_limit'] is not None else self.cfg.max_open_tasks
         can_photos=bool(self.db.can_use_photos(target)) if hasattr(self.db,'can_use_photos') else False
         values=[
             ('Трафер',identity),('Telegram ID',target),('Статус',members_status(u,self.cfg.owner_id)),
             ('Подписка до',self.format_date(u['expires_at'])),
             ('Аккаунты / заказы',f'{number(u["accounts_total"])} / {number(u["tasks_total"])}'),
             ('В очереди / в работе',f'{number(active.get("queued",0))} / {number(sum(active.get(k,0) for k in ACTIVE_STATES))}'),
-            ('Лимиты в сутки / открытых',f'{u["daily_limit"] if u["daily_limit"] is not None else "общий"} / {u["open_limit"] if u["open_limit"] is not None else "общий"}'),
+            ('Лимиты в сутки / открытых',f'{daily_limit or "без лимита"} / {open_limit or "без лимита"}'),
             ('Фото в комментах','Включены' if (is_owner or can_photos) else 'Запрещены'),
             ('Последняя активность',self.format_date(u.get('last_seen',0))),
         ]
@@ -378,12 +452,14 @@ class AdminPanelMixin:
     def render_admin_job(self,t:dict)->tuple[str,str,dict]:
         job_id=t['task_id']
         kind=MODES.get(t['kind'],('Импорт аккаунтов' if t['kind']=='import' else t['kind'],))[0]
-        text=(task_view(t)+'\n\n<b>◇ Сведения о заказе</b>\n'
+        card_options={'timezone_name':self.cfg.timezone_name,'queue_paused':t['state']=='queued' and not self.dispatch_active()}
+        execution_id=public_system_text(t['upstream_id'] or '—')
+        text=(task_view(t,**card_options)+'\n\n<b>◇ Сведения о заказе</b>\n'
               f'├ Трафер: <code>{t["user_id"]}</code>\n'
               f'├ Тип: {h(kind)}\n'
               f'├ Создан: {h(self.format_date(t["created_at"]))}\n'
-              f'└ Внешний ID: <code>{h(t["upstream_id"] or "—")}</code>')
-        rows=[]
+              f'└ ID выполнения · <code>{h(execution_id)}</code>')
+        rows=[self.collected_reply_button(self.cfg.owner_id,t)]
         if t['upstream_id'] and t['state']!='reconcile':
             rows.append([('▤ Результаты','entries:'+job_id,'primary'),('⇩ Экспорт','exports:'+job_id,None)])
             if t['kind'] in PUBLICATION_REPORT_KINDS:
@@ -407,7 +483,7 @@ class AdminPanelMixin:
             rows.append([('↻ Обновить','adm:refresh:'+job_id,None)])
         rows.append([('◇ Трафер','adm:u:'+str(t['user_id']),None),('↶ Заказы','adm:jobs:all:0',None)])
         rich=task_rich(t,(('Трафер',t['user_id']),('Тип',kind),('Создан',self.format_date(t['created_at'])),
-                          ('Внешний ID',t['upstream_id'] or '—')))
+                          ('ID выполнения',execution_id)),**card_options)
         return rich,text,self.owner_keyboard(*rows)
 
     async def admin_report(self,uid:int,tid:str):
@@ -446,10 +522,13 @@ class AdminPanelMixin:
             entries=self.db.subscriptions(target);text='<b>◷ Изменения подписок</b>\n\n'
             for v in entries:
                 text+=(f'├ <code>{v["user_id"]}</code> · {h(v["action"])}'
-                       f' {v["days"]:+d} дн.\n   {self.format_date(v["at"])} · исполнитель {v["actor_id"]}\n')
+                       f' {v["days"]:+d} дн.\n   {self.format_date(v["at"])} · администратор {v["actor_id"]}\n')
         elif mode=='audit':
             entries=self.db.audit_entries();text='<b>▧ Журнал администратора</b>\n\n'
-            for v in entries:text+=f'├ {self.format_date(v["at"])} · <code>{v["user_id"]}</code>\n   {h(v["action"])} / {h(v["target"][:40])}\n'
+            for v in entries:
+                action=CABINET_AUDIT_LABELS.get(v['action']) or public_system_text(v['action'])
+                target_text=public_system_text(v['target'])[:40]
+                text+=f'├ {self.format_date(v["at"])} · <code>{v["user_id"]}</code>\n   {h(action)} / {h(target_text)}\n'
         else:return
         if not entries:text+='Записей пока нет.'
         await self.say(uid,text[:3950],keyboard([('↶ Трафер','adm:u:'+str(target),None)] if target is not None else [('↶ Панель','admin',None)]))
@@ -463,9 +542,10 @@ class AdminPanelMixin:
                 u=self.db.user_summary(r['user_id'])
                 writer.writerow([u['user_id'],u['username'],u['full_name'],_dt(u['first_seen']),_dt(u['last_seen']),_dt(u['expires_at']),u['blocked'],u['accounts_total'],u['tasks_total'],u['daily_limit'],u['open_limit']])
         elif kind=='jobs':
-            writer.writerow(['task_id','user_id','name','kind','state','upstream_id','created_utc','updated_utc','error_code'])
+            writer.writerow(['task_id','user_id','name','kind','state','execution_id','created_utc','updated_utc','error_code'])
             for r in self.db.conn.execute('SELECT task_id,user_id,display_name,kind,state,upstream_id,created_at,updated_at,error_code FROM tasks ORDER BY created_at DESC'):
-                writer.writerow([r['task_id'],r['user_id'],r['display_name'],r['kind'],r['state'],r['upstream_id'] or '',_dt(r['created_at']),_dt(r['updated_at']),r['error_code']])
+                writer.writerow([r['task_id'],r['user_id'],r['display_name'],r['kind'],r['state'],public_system_text(r['upstream_id'] or ''),
+                                 _dt(r['created_at']),_dt(r['updated_at']),public_system_text(r['error_code'])])
         else:
             writer.writerow(['user_id','actor_id','action','days','previous_expires','new_expires','at'])
             for r in self.db.conn.execute('SELECT * FROM subscription_events ORDER BY event_id DESC'):
@@ -685,18 +765,20 @@ class AdminPanelMixin:
         size=10
         page=max(0,min(page,(len(items)-1)//size))
         start=page*size
+        bound=self.db.member_import_folder(target)
         buttons=[]
         for item in items[start:start+size]:
             fid=str(item['id'])
             name=str(item.get('name') or fid).strip()[:24] or fid
             cnt=number(item.get('count') or 0)
             act=number(item.get('active') or 0)
-            buttons.append([(f'▤ {name} ({cnt} · акт. {act})',f'adm:fsp:{target}:{fid}',None)])
+            label=f'▤ {name} ({cnt} · акт. {act})'+(' ✓' if fid==bound else '')
+            buttons.append([(label,f'adm:fsp:{target}:{fid}','primary' if fid==bound else None)])
         if not buttons:
-            rows.append(('Папки','Создай папку для трафера на сайте кабинета'))
+            rows.append(('Папки','Создай папку для трафера в кабинете'))
         buttons.append(pagination(f'adm:foldersync:{target}:',page,start+size<len(items)))
         buttons.append([('↶ Аккаунты',f'adm:uaccounts:{target}',None),('↶ Карточка',f'adm:u:{target}',None)])
-        rich,plain=table_html('▤ Синхронизация с папкой',rows,'Выбери папку кабинета, состав которой нужно сопоставить с пулом трафера.')
+        rich,plain=table_html('▤ Синхронизация с папкой',rows,'Для самостоятельного импорта выбери отдельную папку. Для трафера без аккаунтов создай пустую папку в веб-кабинете.')
         await self.tg.rich(uid,rich,plain,self.owner_keyboard(*buttons))
 
     async def admin_folder_sync_preview(self,uid:int,target:int,fid:str)->None:
@@ -718,11 +800,36 @@ class AdminPanelMixin:
             buttons.append([('＋ Добавить свободные из папки',f'adm:fsg:{target}:{fid}:a','success')])
         if to_add or to_remove:
             buttons.append([('⇄ Точно 1-в-1 (добавить и убрать лишние)',f'adm:fsg:{target}:{fid}:e','danger' if to_remove else 'primary')])
+        if not self.owner(target) and not (to_add or foreign or to_remove):
+            bound_to=self.db.member_import_folder_assignee(fid)
+            if bound_to==target:
+                rows.append(('Самостоятельный импорт','Эта папка уже привязана'))
+            elif bound_to is not None:
+                rows.append(('Самостоятельный импорт','Папка привязана к другому траферу'))
+            else:
+                buttons.append([('✓ Привязать для импорта',f'adm:fsbind:{target}:{fid}','success')])
         buttons.append([('↶ Выбор папки',f'adm:foldersync:{target}',None),('↶ Аккаунты',f'adm:uaccounts:{target}',None)])
         caption=('В этой папке есть аккаунты других траферов — для запуска без ошибок оставь в папке только одного участника.'
                  if foreign else '«Точно 1-в-1» привяжет свободные аккаунты папки и отвяжет аккаунты вне папки (если они не заняты в задачах).')
         rich,plain=table_html('▤ Предпросмотр синхронизации',rows,caption)
         await self.tg.rich(uid,rich,plain,keyboard(*buttons))
+
+    async def admin_bind_import_folder(self,uid:int,target:int,folder_id:str)->None:
+        if not self.owner(uid) or self.owner(target) or not self.db.user(target):return
+        back=keyboard([('↶ Папки',f'adm:foldersync:{target}',None)])
+        if self.account_imports.running_id:
+            return await self.say(uid,'Дождись завершения импорта.',back)
+        try:
+            with self.db.account_action(None,allow_in_flight=True):
+                assigned=set(self.db.account_ids(target))
+                await self.account_imports.validate_member_folder(target,folder_id,assigned)
+                self.db.bind_member_import_folder(target,folder_id)
+        except ApiError as exc:
+            return await self.say(uid,safe_api_error(exc.code),back)
+        except ValueError as exc:
+            return await self.say(uid,h(exc),back)
+        self.db.log(uid,'member_import_folder',f'{target}:{folder_id}')
+        await self.say(uid,'Папка привязана. Трафер может загрузить файл через «Мои аккаунты».',back)
 
     async def admin_folder_sync_apply(self,uid:int,target:int,fid:str,mode:str)->None:
         if not self.owner(uid):return
@@ -847,7 +954,7 @@ class AdminPanelMixin:
         text=(f'<b>↻ Сверка заказа</b> · <code>{tid}</code>\n\n'
               'Проверь задание в кабинете. Поиск по маркеру продолжает работать в фоне.')
         if name:text+=f'\n\nНазвание в кабинете\n<code>{h(name)}</code>'
-        if job['upstream_id']:text+=f'\nВнешний ID · <code>{h(job["upstream_id"])}</code>'
+        if job['upstream_id']:text+=f'\nID выполнения · <code>{h(public_system_text(job["upstream_id"]))}</code>'
         if job['error_code']=='reconcile_review':text+='\nПовторный запуск удержан.'
         await self.say(uid,text,keyboard(*rows))
 
@@ -966,17 +1073,23 @@ class AdminPanelMixin:
                 await self.admin_folder_sync_list(uid,int(fields[2]),int(fields[3]))
             elif len(fields)==4 and fields[1]=='fsp' and valid_member_id(fields[2]) and ACCOUNT_FOLDER_ID.fullmatch(fields[3]):
                 await self.admin_folder_sync_preview(uid,int(fields[2]),fields[3])
+            elif len(fields)==4 and fields[1]=='fsbind' and valid_member_id(fields[2]) and ACCOUNT_FOLDER_ID.fullmatch(fields[3]):
+                await self.admin_bind_import_folder(uid,int(fields[2]),fields[3])
             elif len(fields)==5 and fields[1]=='fsg' and valid_member_id(fields[2]) and ACCOUNT_FOLDER_ID.fullmatch(fields[3]) and fields[4] in ('a','e'):
                 await self.admin_folder_sync_apply(uid,int(fields[2]),fields[3],fields[4])
             elif data=='adm:onboard':
+                admission=getattr(self,'bot_admission',None)
+                first_step=('Попроси человека открыть бота и отправить заявку. Рассмотри её в разделе «Заявки на вход».'
+                            if admission else 'Попроси человека открыть бота и отправить тебе свой ID из /myid.')
                 rich,plain=table_html('◇ Как подключить участника',[
-                    ('1. Telegram','Попроси человека открыть бота и отправить тебе свой ID из /myid.'),
-                    ('2. Доступ','Выдай срок по Telegram ID. При необходимости задай лимиты задач.'),
+                    ('1. Вход',first_step),
+                    ('2. Подписка','Укажи срок подписки по Telegram ID. При необходимости задай лимиты задач.'),
                     ('3. Аккаунты','В карточке участника назначь свободные аккаунты или загрузи его файл.'),
                     ('4. Проверка','Проверь сессии пула. Участник увидит свои аккаунты и сможет создать заказ.'),
                 ],'Управление общими прокси доступно владельцу.')
                 await self.tg.rich(uid,rich,plain,keyboard(
-                    [('＋ Выдать доступ','adm:pick:grant','success')],[('↶ Панель','admin',None)]))
+                    [('◇ Заявки на вход',ENTRY_LIST,None)] if admission else [],
+                    [('＋ Выдать подписку','adm:pick:grant','success')],[('↶ Панель','admin',None)]))
             elif data=='adm:search':
                 self.db.save_draft(uid,'admin_search','input',{})
                 await self.say(uid,'<b>⌕ Поиск трафера</b>\n\nОтправь Telegram ID, @username или имя.',
@@ -986,11 +1099,9 @@ class AdminPanelMixin:
                 await self.say(uid,'<b>＋ Выдать подписку</b>\n\nОтправь Telegram ID трафера. На следующем шаге укажи срок.',
                                keyboard([('↶ Отмена','adm:discard',None)]))
             elif data=='adm:api':
-                await self.say(uid,'<b>▣ Управление общим API</b>\n\n'
-                    'Разделы аккаунтов, прокси, публикаций и материалов доступны в меню владельца. '
-                    'Команды /api и /op — только для главного администратора.',keyboard(
+                await self.say(uid,'<b>▣ Кабинет Proxima</b>',keyboard(
                     [('◇ Аккаунты','accounts',None),('◈ Прокси','proxies',None)],
-                    [('▣ Публикации','posts',None),('▤ Материалы','materials',None)],
+                    ([('▣ Публикации','posts',None)] if self.media_orders_visible(uid) else [])+[('▤ Материалы','materials',None)],
                     [('▤ Статистика кабинета','owner_show:stats',None),('⚙ Настройки','settings',None)],
                     [('↶ Панель','admin',None)]))
             elif data=='adm:exports':
